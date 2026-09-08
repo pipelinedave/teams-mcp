@@ -1,0 +1,36 @@
+{
+  "name": "teams-mcp",
+  "version": "1.0.0",
+  "description": "Microsoft Teams MCP Server via Multi-Tenant Playwright Browser Bridge",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "teams-mcp": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "src/"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js && node --check src/config.js && node --check src/browserManager.js && node --check src/teamsClient.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "microsoft-teams",
+    "teams",
+    "playwright",
+    "automation"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "playwright-core": "^1.50.1",
+    "turndown": "^7.2.0",
+    "zod": "^3.24.2"
+  }
+}

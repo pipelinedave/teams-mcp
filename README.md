@@ -1,0 +1,140 @@
+# Teams MCP Server
+
+Microsoft Teams MCP-Server auf Basis einer **Multi-Tenant Playwright Browser-Bridge**.
+Steuert den echten Teams-Webclient im Chromium/Chrome über CDP – kein offizielles
+API-Integration, dafür mit echten Browser-Sessions und ohne Cloud-Relay.
+
+Ermöglicht LLM-Agenten (opencode, Claude, Cursor, …) den Lese-/Schreibzugriff auf
+Microsoft Teams: Chats listen, Nachrichten lesen, durchsuchen, Teams/Channels auflisten
+und Nachrichten senden – jeweils in einem isolierten Browser-Profil pro Konto/Tenant.
+
+> **Hinweis**: Dieses Repository ist komplett organisationsneutral. Es enthält keine
+> firmenspezifischen Tenants, Accounts oder Zugangsdaten. Alle Zugänge werden von
+> dir selbst pro Tenant konfiguriert und per einmaligem Browser-Login eingerichtet.
+
+## Features
+
+- **Multi-Tenant**: Jeder Tenant/Account bekommt ein isoliertes Browser-Profil
+  (`.teams-browser-profile-<tenant>`) – keine Session-Kollisionen.
+- **8 Tools**: `teams_status`, `teams_login`, `teams_list_chats`, `teams_get_messages`,
+  `teams_search`, `teams_list_teams`, `teams_send_message`, `teams_close`.
+- **Konsistente Chat-Adressierung**: `chat_index` und `chat_name` lösen auf dieselbe
+  Chat-Liste auf (kein falscher Chat durch DOM-Index-Versatz).
+- **Sichere Sendesemantik**: `teams_send_message` sendet nicht blind in den aktiven
+  Chat, wenn der Ziel-Chat nicht eindeutig gefunden wird – es wirft stattdessen einen Fehler.
+- **Robust**: Retry gegen Browser-Profil-Lock-Kollisionen (parallele Sessions),
+  klare Fehler bei abgelaufener Login-Session.
+
+## Voraussetzungen
+
+- Node.js ≥ 20
+- Ein installiertes Chromium/Chrome/Edge. Automatische Erkennung an gängigen Orten
+  (Playwright-Cache, `/usr/bin`, macOS-Apps). Alternativ per `TEAMS_MCP_CHROME_PATH` setzen.
+- (Optional) WSLg / eine grafische Umgebung für das einmalige Login-Fenster.
+
+## Installation
+
+```bash
+git clone <your-repo-url> teams-mcp
+cd teams-mcp
+npm install
+```
+
+## Konfiguration (Umgebungsvariablen)
+
+Alle Optionen sind optional. Im Standardfall funktioniert der Server org-neutral,
+indem der `tenant`-Wert, den du an die Tools übergibst, direkt als Konto/Realm
+verwendet wird (z.B. `tenant: "deine-org.onmicrosoft.com"`).
+
+| Variable | Beschreibung | Default |
+|---|---|---|
+| `TEAMS_MCP_CHROME_PATH` | Pfad zur Chrome/Chromium/Edge-Executable | Auto-Detect |
+| `TEAMS_MCP_PROFILE_BASE` | Basis-Verzeichnis für die Browser-Profile | `$HOME` |
+| `TEAMS_MCP_TENANTS` | Kommagetrennte Whitelist erlaubter Tenant-Keys (für validierte Auswahl in den Tool-Schemas) | – |
+| `TEAMS_MCP_TENANT_REALMS` | JSON-Objekt `{ "key": "realm" }` zur Abbildung von Kurznamen auf Realm | – (tenant = realm) |
+| `TEAMS_MCP_SELF_NAME` | Eigener Anzeigename für „Ich“-Nachrichten | `"Ich"` |
+| `TEAMS_MCP_HEADLESS` | Headless-Default (`true`/`false`) | `true` |
+
+### Beispiele
+
+Kurznamen auf Realms mappen (z.B. für zwei Konten bei zwei Organisationen):
+
+```bash
+export TEAMS_MCP_TENANT_REALMS='{"arbeit":"arbeit.onmicrosoft.com","privat":"privat.onmicrosoft.com"}'
+export TEAMS_MCP_TENANTS='arbeit,privat'
+```
+
+Oder ganz ohne Konfiguration – einfach immer den vollständigen Realm übergeben:
+
+```bash
+# tools mit tenant: "meine-org.onmicrosoft.com"
+```
+
+## In opencode konfigurieren
+
+Ergänze in `opencode.json` einen MCP-Server-Eintrag (Pfade anpassen):
+
+```json
+{
+  "mcp": {
+    "teams": {
+      "type": "local",
+      "command": ["node", "/abs/path/zu/teams-mcp/index.js"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Für andere MCP-Clients (Claude Desktop, Cursor, …) starte den Server entsprechend
+über `index.js` bzw. das `teams-mcp`-Binärskript.
+
+## Erste Schritte (Login)
+
+1. `teams_login({ tenant: "deine-org.onmicrosoft.com" })` – öffnet ein **sichtbares**
+   Browserfenster.
+2. Melde dich dort einmalig an (inkl. MFA). Die Session wird dauerhaft im
+   Tenant-Profil (`~/.teams-browser-profile-<tenant>`) gespeichert.
+3. Danach sind alle Tools für diesen Tenant bereit.
+
+> **Hinweis**: Das Login ist immer sichtbar. Headless wird nur für die Lese-/
+> Schreib-Tools verwendet, nachdem du dich einmalig angemeldet hast.
+
+## Bedienung & Architektur
+
+- **Chat-Adresse**: Nutze `teams_list_chats` für den Chat-`index` ODER den exakten
+  Chat-`name`. Beide Wege führen zuverlässig zum selben Chat (exakter Titel-Match,
+  danach Präfix-/Token-Match).
+- **Tenant-Pflicht**: Jedes Tool erwartet einen `tenant`-Wert. Ohne Konfiguration ist
+  das der Realm deiner Organisation (z.B. `deine-org.onmicrosoft.com`).
+- **Chrome-Pfad**: Wird kein Browser erkannt, warnt der Server beim Start und erwartet
+  `TEAMS_MCP_CHROME_PATH`.
+- **Profil-Lock**: Wird ein Profil gerade von einer anderen Instanz genutzt (z.B. eine
+  zweite parallele Agenten-Session), wartet der Server mit Backoff und wirft sonst eine
+  klare Meldung.
+
+## Projektstruktur
+
+```
+teams-mcp/
+├── index.js               # MCP-Server (Tool-Schema + Dispatch)
+├── src/
+│   ├── config.js          # Zentrale, per Env überschreibbare Konfiguration
+│   ├── browserManager.js  # Playwright-Profil-Management (Multi-Tenant, Locks)
+│   └── teamsClient.js     # Teams-Web-Automation (Chats, Messages, Search, Send)
+└── package.json
+```
+
+## Sicherheit & Compliance
+
+- Dieser Server interagiert mit Microsoft Teams Web über deine eigenen
+  Browser-Sessions – es werden keine Zugangsdaten gespeichert oder übertragen.
+- Die Browser-Profile mit den Login-Sessions liegen ausschließlich lokal
+  (`~/.teams-browser-profile-<tenant>`) und sind in `.gitignore` ausgeschlossen.
+- Stelle sicher, dass die Nutzung die Richtlinien deiner Organisation und die
+  geltenden Datenschutz-Anforderungen (z.B. DSGVO) erfüllt.
+
+## Lizenz
+
+Siehe `LICENSE`. (Standard: zum privaten/internen Gebrauch oder wie in der LICENSE-Datei
+angegeben.)
