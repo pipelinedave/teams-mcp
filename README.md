@@ -22,6 +22,11 @@ und Nachrichten senden – jeweils in einem isolierten Browser-Profil pro Konto/
   Chat-Liste auf (kein falscher Chat durch DOM-Index-Versatz).
 - **Sichere Sendesemantik**: `teams_send_message` sendet nicht blind in den aktiven
   Chat, wenn der Ziel-Chat nicht eindeutig gefunden wird – es wirft stattdessen einen Fehler.
+  Vor dem Versand verifiziert ein **Sicherheitsnetz**, dass der tatsächlich geöffnete Chat dem
+  Ziel entspricht, sonst wird abgebrochen (kein Fehlversand).
+- **Mehrzeilige Nachrichten**: Nachrichten werden per **Clipboard-Paste** eingefügt statt per
+  Tastatureingabe – dadurch bleiben Umlaute/Sonderzeichen intakt und Zeilenumbrüche werden
+  nicht fälschlich als „Absenden“ interpretiert (kein Zersplittern in mehrere Fragmente).
 - **Robust**: Retry gegen Browser-Profil-Lock-Kollisionen (parallele Sessions),
   klare Fehler bei abgelaufener Login-Session.
 
@@ -133,6 +138,40 @@ teams-mcp/
   (`~/.teams-browser-profile-<tenant>`) und sind in `.gitignore` ausgeschlossen.
 - Stelle sicher, dass die Nutzung die Richtlinien deiner Organisation und die
   geltenden Datenschutz-Anforderungen (z.B. DSGVO) erfüllt.
+
+## Tests
+
+Das Projekt verwendet den eingebauten Node-Test-Runner (`node:test`) – keine zusätzlichen
+Abhängigkeiten.
+
+**Unit-Tests** (kein Browser, keine Netzwerkzugriffe):
+
+```bash
+npm test            # = node --test tests/unit.test.mjs
+```
+
+**Integrationstests** (gegen einen echten, bereits angemeldeten Teams-Tenant):
+
+```bash
+npm run test:integration          # LANGSAM, sendet NICHT (Standard: Sende-Test gesperrt)
+```
+
+Der Integrationstest prüft `status`, `list_chats` (Index-Konsistenz), `get_messages`
+(Name↔Index-Auflösung), `search`, `list_teams` und `send_message`.
+
+> ⚠️ **Sicherheit beim Senden**: Standardmäßig wird der Sende-Teil des Integrationstests
+> **übersprungen**. Nur wenn du ihn explizit freigibst UND als Empfänger deinen eigenen
+> Self-Chat angegeben hast, wird tatsächlich eine Nachricht gesendet:
+>
+> ```bash
+> TMS_TEST_TENANT=deine-org.onmicrosoft.com \
+> TMS_TEST_SEND_ALLOWED=true \
+> TMS_TEST_RECIPIENT="Dein Name" \      # unbedingt dein eigener Self-Chat!
+> node tests/integration.test.mjs
+> ```
+>
+> So wird in Testläufen garantiert **nur an dich selbst** gesendet – niemals in einen
+> fremden oder Gruppen-Chat.
 
 ## Lizenz
 

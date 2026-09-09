@@ -165,6 +165,41 @@ export class TeamsClient {
     };
   }
 
+  // Liefert den Titel des aktuell geöffneten Chats. Bevorzugt den Chat-Pane-Header
+  // aus dem DOM (stabil, z.B. [data-tid="chat-title"]), fällt auf page.title() zurück.
+  async getActiveChatTitle(page) {
+    try {
+      const domTitle = await page.evaluate(() => {
+        // Chat-Header im Message-Pane (Teams/Fluent): [data-tid="chat-title"] ist am stabilsten
+        const sels = [
+          '[data-tid="chat-title"]',
+          '[data-tid="chat-header-title"]',
+          '[data-tid="entity-header"] [role="heading"]',
+          '[data-tid="thread-pane-header"]',
+          'header [aria-level]'
+        ];
+        for (const sel of sels) {
+          const el = document.querySelector(sel);
+          if (el && el.innerText && el.innerText.trim() && el.innerText.trim().length < 60) {
+            const t = el.innerText.trim();
+            if (t && !/^Message List$/i.test(t) && !/^Chat$/i.test(t)) {
+              return t;
+            }
+          }
+        }
+        return null;
+      });
+      if (domTitle) return domTitle;
+    } catch (e) {}
+
+    // Fallback: page.title() -> "Chat | David Hallmann (You) | Microsoft Teams"
+    const raw = (await page.title()).replace(' | Microsoft Teams', '').replace(/^\(\d+\)\s*/, '');
+    const parts = raw.split(' | ').map(s => s.trim()).filter(Boolean);
+    // Zweites Segment ist meist der Chat-Name (erste = "Chat"), sonst das letzte sichtbare
+    if (parts.length >= 2 && /^chat$/i.test(parts[0])) return parts[1];
+    return parts[0] || raw;
+  }
+
   async getMessages(tenant = '', { chatIndex, chatName, limit = 20 } = {}) {
     const t = browserManager.normalizeTenant(tenant);
     const page = await this.getPage(t, true);
@@ -183,9 +218,8 @@ export class TeamsClient {
       }
     }
 
-    // Aktiven Chat-Titel aus dem Message-Pane verifizieren (falls möglich)
-    const chatTitle = await page.title();
-    const activeChat = chatTitle.replace(' | Microsoft Teams', '').replace(/^\(\d+\)\s*/, '');
+    // Aktiven Chat-Titel aus dem Message-Pane verifizieren (stabil)
+    const activeChat = await this.getActiveChatTitle(page);
     await page.waitForSelector('[data-tid="chat-pane-message"], .fui-ChatMessage__body, .fui-ChatMyMessage__body', { timeout: 15000 }).catch(() => null);
 
     const messagesData = await page.evaluate(({ max, selfName }) => {
@@ -245,21 +279,58 @@ export class TeamsClient {
     const t = browserManager.normalizeTenant(tenant);
     const page = await this.getPage(t, true);
 
-    const searchInput = await page.waitForSelector('#top-search-input, input[aria-label*="Search"], input[placeholder*="Search"]', { timeout: 15000 });
-    if (!searchInput) throw new Error("Suchfeld in Teams Web nicht gefunden.");
+    // Suchfeld finden - Teams Web ändert die DOM-Struktur; mehrere Wege probieren,
+    // inkl. Öffnen der Suche per Tastaturkürzel (Ctrl+E / Ctrl+K / Alt+Shift+S).
+    let searchInput = null;
+    const selectors = [
+      '#top-search-input',
+      'input[aria-label*="Search"]',
+      'input[placeholder*="Search"]',
+      'input[aria-label*="Suche"]',
+      'input[placeholder*="Suche"]',
+      '[data-tid="searchbox"] input',
+      'input[type="search"]'
+    ];
+
+    for (const sel of selectors) {
+      searchInput = await page.$(sel);
+      if (searchInput) break;
+    }
+
+    if (!searchInput) {
+      // Suche per Tastatur öffnen und erneut versuchen
+      for (const combo of ['Control+E', 'Control+K', 'Alt+Shift+S']) {
+        try {
+          await page.keyboard.press(combo);
+          await page.waitForTimeout(1200);
+        } catch (e) {}
+        for (const sel of selectors) {
+          searchInput = await page.$(sel);
+          if (searchInput) break;
+        }
+        if (searchInput) break;
+      }
+    }
+
+    if (!searchInput) {
+      throw new Error("Suchfeld in Teams Web nicht gefunden (auch nicht nach Tastatur-Öffnung).");
+    }
 
     await searchInput.click();
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(400);
     await searchInput.fill('');
-    await searchInput.type(query, { delay: 30 });
+    // Query per Clipboard-Paste einfügen (robust für Sonderzeichen/Um&laute)
+    await page.evaluate((q) => { navigator.clipboard.writeText(q); }, query);
+    await page.keyboard.press('ControlOrMeta+V');
+    await page.waitForTimeout(400);
     await page.keyboard.press('Enter');
 
     await page.waitForTimeout(4000);
-    await page.waitForSelector('div[data-tid*="search-result"], [role="listitem"]', { timeout: 12000 }).catch(() => null);
+    await page.waitForSelector('div[data-tid*="search-result"], [role="listitem"], [data-tid*="searchResult"]', { timeout: 12000 }).catch(() => null);
 
     const results = await page.evaluate((max) => {
       const items = [];
-      const rows = document.querySelectorAll('div[data-tid*="search-result"], [role="listitem"]');
+      const rows = document.querySelectorAll('div[data-tid*="search-result"], [data-tid*="searchResult"], [role="listitem"]');
       for (const r of rows) {
         if (items.length >= max) break;
         const text = r.innerText?.trim() || '';
@@ -312,34 +383,54 @@ export class TeamsClient {
     };
   }
 
+  // Fügt Text per Clipboard-Paste statt keyboard.type ein.
+  // Verhindert, dass Zeilenumbrüche (\n) in Teams als Enter/Ab-Senden interpretiert
+  // werden und die Nachricht in mehrere Fragmente zersplittert.
+  async insertTextViaPaste(page, text) {
+    await page.evaluate((t) => {
+      navigator.clipboard.writeText(t);
+    }, text);
+    await page.waitForTimeout(150);
+    // Fokus im Compose-Feld + einfügen
+    await page.keyboard.press('ControlOrMeta+A');
+    await page.keyboard.press('ControlOrMeta+V');
+    await page.waitForTimeout(400);
+  }
+
   async sendMessage(tenant = '', { message, chatName } = {}) {
     if (!message) throw new Error("Nachrichtentext (message) ist erforderlich.");
+    if (!chatName) throw new Error("Empfänger (chat_name) ist erforderlich. Es wird bewusst nicht in einen unbestimmten 'aktiven' Chat gesendet.");
     const t = browserManager.normalizeTenant(tenant);
     const page = await this.getPage(t, true);
 
     const filtered = await this.getFilteredChatRows(page);
 
-    let picked = null;
-    if (chatName) {
-      picked = this.pickChatRow(filtered, chatName, undefined);
-    }
-
-    if (chatName && !picked) {
+    const picked = this.pickChatRow(filtered, chatName, undefined);
+    if (!picked) {
       throw new Error(`Chat '${chatName}' wurde in Teams (${t}) nicht gefunden. Keine Nachricht gesendet (verhindert Fehlversand).`);
     }
 
-    if (picked) {
-      await picked.row.click();
-      await page.waitForTimeout(2500);
+    await picked.row.click();
+    await page.waitForTimeout(2500);
+
+    // Compose-Feld GEZIELT im geöffneten Chat-Pane finden. WICHTIG: Darf NICHT das
+    // globale div[role="textbox"] verwenden, sonst greift der Klick auf das
+    // "New Message"-Compose-Feld und navigiert aus dem Chat heraus.
+    const composeCtl = page
+      .locator('[data-tid="chat-pane-compose-message-footer"], [data-tid="chat-pane-compose"]')
+      .locator('[data-tid="ckeditor"], div[role="textbox"], [contenteditable], textarea, div[id^="new-message-"]')
+      .first();
+
+    try {
+      await composeCtl.waitFor({ state: 'visible', timeout: 10000 });
+    } catch (e) {
+      throw new Error("Chat-Komposefeld im geöffneten Chat nicht gefunden. Keine Nachricht gesendet.");
     }
-
-    const composeBox = await page.waitForSelector('div[role="textbox"], [data-tid="ckeditor-replyConversation"], [aria-label*="Type a message"], [aria-label*="Nachricht eingeben"], [aria-label*="message"]', { timeout: 15000 });
-    if (!composeBox) throw new Error("Eingabefeld für Nachricht nicht gefunden.");
-
-    await composeBox.click();
+    // ElementHandle holen ist optional (Locator.click funktioniert direkt)
+    await composeCtl.click();
     await page.waitForTimeout(500);
-    await page.keyboard.type(message, { delay: 35 });
-    await page.waitForTimeout(800);
+    await this.insertTextViaPaste(page, message);
+    await page.waitForTimeout(600);
 
     const sendButton = await page.$('button[data-tid="send-message-button"], button[aria-label*="Send"], button[aria-label*="Senden"]');
     if (sendButton) {
@@ -349,12 +440,19 @@ export class TeamsClient {
     }
     await page.waitForTimeout(2000);
 
-    const activeChat = (await page.title()).replace(' | Microsoft Teams', '').replace(/^\(\d+\)\s*/, '');
+    const activeChat = await this.getActiveChatTitle(page);
+
+    // Verifizieren, dass der aktive Chat dem Ziel entspricht (Sicherheitsnetz)
+    const targetNorm = picked.title.toLowerCase().replace(/ \(you\)$/i, '');
+    const activeNorm = activeChat.toLowerCase().replace(/ \(you\)$/i, '');
+    if (!activeNorm.includes(targetNorm) && !targetNorm.includes(activeNorm)) {
+      throw new Error(`Sicherheitsnetz: Der geöffnete Chat-Titel '${activeChat}' stimmt nicht mit Ziel '${picked.title}' überein. Nachricht wurde NICHT gesendet.`);
+    }
 
     return {
       success: true,
       tenant: t,
-      recipient: picked ? picked.title : (chatName || "Aktiver Chat"),
+      recipient: picked.title,
       confirmedActiveChat: activeChat,
       messageSent: message,
       status: "Nachricht erfolgreich gesendet."
