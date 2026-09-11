@@ -248,21 +248,50 @@ export class SpeakerTracker {
   }
 
   /**
-   * Scans the Teams calendar for a currently running or about-to-start meeting
-   * and joins it silently (mic + cam off).
-   *
-   * Strategy:
-   *   1. Navigate to teams.microsoft.com (home/calendar)
-   *   2. Look for a visible "Beitreten" / "Join" button on a meeting card
-   *   3. OR extract a meetup-join link from the page
-   *   4. Click/navigate and call _handlePreJoinScreen
+   * Scans Teams for a currently running meeting, spontaneous 1:1 call,
+   * or upcoming calendar meeting and joins it silently (mic + cam off).
    */
   async findAndJoinNextMeeting(page) {
-    console.log(`[SpeakerTracker] Scanning Teams calendar for current/next meeting...`);
+    console.log(`[SpeakerTracker] Checking Teams for active call or meeting...`);
 
-    // Navigate to Teams calendar
+    // 1. Bereits in einem Call/Meeting?
+    try {
+      const currentInfo = await this.inspectMeeting(page);
+      if (currentInfo && currentInfo.inMeeting) {
+        console.log(`[SpeakerTracker] Already inside active meeting: ${currentInfo.meetingTitle}`);
+        return { joined: true, meetingTitle: currentInfo.meetingTitle, participants: currentInfo.participants };
+      }
+    } catch (_) {}
+
+    // 2. Prüfen auf aktives Call-Banner ("Zurück zum Anruf" / "Return to call" / "Beitreten")
+    const activeCallBannerSelectors = [
+      '[data-tid="call-active-bar"] button',
+      'button[aria-label*="Zurück zum Anruf" i]',
+      'button[aria-label*="Return to call" i]',
+      'button:has-text("Zurück zum Anruf")',
+      'button:has-text("Return to call")',
+      'button[aria-label*="Aktiver Anruf" i]',
+      '[data-tid*="active-call"] button',
+      '#calling-header-container button',
+    ];
+
+    for (const sel of activeCallBannerSelectors) {
+      try {
+        const btn = await page.$(sel);
+        if (btn && await btn.isVisible()) {
+          console.log(`[SpeakerTracker] Found active call banner, clicking to join/return...`);
+          await btn.click();
+          await this._handlePreJoinScreen(page);
+          const info = await this.inspectMeeting(page);
+          return { joined: true, meetingTitle: info.meetingTitle || 'Aktiver Teams-Anruf', participants: info.participants };
+        }
+      } catch (_) {}
+    }
+
+    // 3. Kalender prüfen (für geplante Termine)
+    console.log(`[SpeakerTracker] Scanning Teams calendar for current/next meeting...`);
     await page.goto('https://teams.microsoft.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(2500);
 
     // Try clicking the Calendar icon in the left nav
     const calNavSelectors = [
@@ -296,20 +325,18 @@ export class SpeakerTracker {
     for (const sel of joinBtnSelectors) {
       try {
         const btn = await page.$(sel);
-        if (btn) {
-          const visible = await btn.isVisible();
-          if (visible) {
-            console.log(`[SpeakerTracker] Found Join button, clicking...`);
-            await btn.click();
-            await this._handlePreJoinScreen(page);
-            console.log(`[SpeakerTracker] Successfully joined meeting from calendar.`);
-            return;
-          }
+        if (btn && await btn.isVisible()) {
+          console.log(`[SpeakerTracker] Found Join button, clicking...`);
+          await btn.click();
+          await this._handlePreJoinScreen(page);
+          console.log(`[SpeakerTracker] Successfully joined meeting from calendar.`);
+          const info = await this.inspectMeeting(page);
+          return { joined: true, meetingTitle: info.meetingTitle, participants: info.participants };
         }
       } catch (_) {}
     }
 
-    // Fallback: extract a meetup-join link from the DOM
+    // Fallback Kalender-Link: extract a meetup-join link from the DOM
     try {
       const joinUrl = await page.evaluate(() => {
         const links = Array.from(document.querySelectorAll('a[href*="meetup-join"], a[href*="teams.microsoft.com/l/"]'));
@@ -321,12 +348,40 @@ export class SpeakerTracker {
         await page.goto(joinUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
         await this._handlePreJoinScreen(page);
         console.log(`[SpeakerTracker] Successfully joined meeting via link.`);
-        return;
+        const info = await this.inspectMeeting(page);
+        return { joined: true, meetingTitle: info.meetingTitle, participants: info.participants };
       }
     } catch (_) {}
 
-    // If nothing found: warn but don't crash — tracking will still work if user is already in a meeting tab
-    console.warn(`[SpeakerTracker] No joinable meeting found in Teams calendar. Continuing without auto-join.`);
+    // 4. Fallback für spontane 1:1 Anrufe: Letzten aktiven Chat prüfen
+    console.log(`[SpeakerTracker] No calendar meeting found. Checking recent chats for 1:1 call partner...`);
+    try {
+      await page.keyboard.press('Control+Shift+4'); // Chat-App
+      await page.waitForTimeout(2000);
+
+      // Ermittle den obersten Chat in der Liste
+      const topChatInfo = await page.evaluate(() => {
+        const chatRows = document.querySelectorAll('[role="listitem"] [data-tid*="chat-list-entry"], [role="treeitem"], [data-tid="chat-list-item"]');
+        if (chatRows.length > 0) {
+          const first = chatRows[0];
+          const nameEl = first.querySelector('[data-tid*="title"], [class*="title"], span[dir="auto"], h3');
+          const title = (nameEl ? (nameEl.innerText || nameEl.textContent) : first.innerText || '').split('\n')[0].trim();
+          return { title };
+        }
+        return null;
+      });
+
+      if (topChatInfo && topChatInfo.title) {
+        const cleanName = cleanSpeakerName(topChatInfo.title);
+        console.log(`[SpeakerTracker] Detected active/recent chat partner: '${cleanName}'`);
+        return { joined: false, meetingTitle: `1:1 Call ${cleanName}`, knownSpeakers: [cleanName] };
+      }
+    } catch (e) {
+      console.warn(`[SpeakerTracker] Could not inspect chat list: ${e.message}`);
+    }
+
+    console.warn(`[SpeakerTracker] No joinable meeting or call found. Continuing without auto-join.`);
+    return { joined: false, meetingTitle: 'Teams Meeting', knownSpeakers: [] };
   }
 
   /**
@@ -337,13 +392,22 @@ export class SpeakerTracker {
       await this.stopTracking(tenant);
     }
 
-    // Auto-join: navigate to meeting URL or find next meeting in calendar
-    const { meetingUrl, autoJoin = true, noJoin = false } = options;
+    // Auto-join: navigate to meeting URL, find call/meeting, or detect 1:1 chat partner
+    const { meetingUrl, autoJoin = true, noJoin = false, speaker = null } = options;
+    let knownSpeakers = speaker ? [cleanSpeakerName(speaker)] : [];
+    let detectedMeetingTitle = '';
+
     if (!noJoin) {
       if (meetingUrl) {
         await this.joinMeetingByUrl(page, meetingUrl);
       } else if (autoJoin) {
-        await this.findAndJoinNextMeeting(page);
+        const joinRes = await this.findAndJoinNextMeeting(page);
+        if (joinRes) {
+          if (joinRes.meetingTitle) detectedMeetingTitle = joinRes.meetingTitle;
+          if (joinRes.knownSpeakers && joinRes.knownSpeakers.length > 0) {
+            knownSpeakers = Array.from(new Set([...knownSpeakers, ...joinRes.knownSpeakers]));
+          }
+        }
       }
     }
 
@@ -417,7 +481,8 @@ export class SpeakerTracker {
       outputPath,
       pollInterval,
       samples,
-      meetingTitle: meetingInfo.meetingTitle || 'Teams Meeting'
+      meetingTitle: detectedMeetingTitle || meetingInfo.meetingTitle || 'Teams Meeting',
+      knownSpeakers
     };
 
     this.activeSessions.set(tenant, session);
@@ -428,7 +493,8 @@ export class SpeakerTracker {
       startTimeEpochMs,
       meetingTitle: session.meetingTitle,
       inMeeting: meetingInfo.inMeeting,
-      participants: meetingInfo.participants
+      participants: meetingInfo.participants,
+      knownSpeakers
     };
   }
 
@@ -477,6 +543,10 @@ export class SpeakerTracker {
     });
 
     const uniqueSpeakers = Array.from(new Set(intervals.map(i => i.speaker)));
+    let finalSpeakers = uniqueSpeakers;
+    if (finalSpeakers.length === 0 && session.knownSpeakers && session.knownSpeakers.length > 0) {
+      finalSpeakers = session.knownSpeakers;
+    }
 
     const result = {
       version: '1.0',
@@ -485,8 +555,8 @@ export class SpeakerTracker {
       start_time_epoch_ms: startTimeEpochMs,
       end_time_epoch_ms: endTimeEpochMs,
       duration_sec: durationSec,
-      speaker_count: uniqueSpeakers.length,
-      speakers: uniqueSpeakers,
+      speaker_count: finalSpeakers.length,
+      speakers: finalSpeakers,
       intervals
     };
 
