@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import TurndownService from 'turndown';
 import { browserManager } from './browserManager.js';
 import { config } from './config.js';
@@ -398,9 +400,182 @@ export class TeamsClient {
     await page.waitForTimeout(400);
   }
 
-  async sendMessage(tenant = '', { message, chatName } = {}) {
+  // Validiert und normalisiert Dateipfade für Anhänge
+  validateAttachments(attachments) {
+    if (!attachments) return [];
+    const list = Array.isArray(attachments) ? attachments : [attachments];
+    const resolved = [];
+    for (const item of list) {
+      if (!item || typeof item !== 'string') continue;
+      const trimmed = item.trim();
+      if (!trimmed) continue;
+      const abs = path.resolve(trimmed);
+      if (!fs.existsSync(abs)) {
+        throw new Error(`Anhang-Datei nicht gefunden: "${trimmed}" (aufgelöst: "${abs}")`);
+      }
+      const stat = fs.statSync(abs);
+      if (!stat.isFile()) {
+        throw new Error(`Anhang ist keine reguläre Datei: "${trimmed}"`);
+      }
+      resolved.push(abs);
+    }
+    return resolved;
+  }
+
+  // Hängt eine oder mehrere lokale Dateien im Teams Chat-Compose-Bereich an
+  async attachFiles(page, filePaths) {
+    if (!filePaths || filePaths.length === 0) return;
+
+    // 1. Kaskade: Existiert bereits ein input[type="file"] auf der Seite?
+    const fileInputs = await page.$$('input[type="file"]');
+    if (fileInputs.length > 0) {
+      for (const input of fileInputs) {
+        try {
+          await input.setInputFiles(filePaths);
+          await this.waitForAttachmentUpload(page, filePaths);
+          return;
+        } catch (e) {
+          // Fallback zum nächsten Weg
+        }
+      }
+    }
+
+    // 2. Kaskade: Büroklammer / Attach-Button im Compose-Footer
+    const attachButtonSelectors = [
+      '[data-tid="chat-pane-compose-message-footer"] button[data-tid="attach-button"]',
+      '[data-tid="chat-pane-compose-message-footer"] button[data-tid="compose-attach-button"]',
+      '[data-tid="chat-pane-compose"] button[aria-label*="anhängen" i]',
+      '[data-tid="chat-pane-compose"] button[aria-label*="attach" i]',
+      '[data-tid="chat-pane-compose"] button[title*="anhängen" i]',
+      '[data-tid="chat-pane-compose"] button[title*="attach" i]',
+      'button[data-tid="attach-button"]',
+      'button[data-tid="compose-attach-button"]',
+      'button[data-tid="expand-compose-actions-button"]'
+    ];
+
+    let attachBtn = null;
+    for (const sel of attachButtonSelectors) {
+      attachBtn = await page.$(sel);
+      if (attachBtn) break;
+    }
+
+    if (!attachBtn) {
+      throw new Error("Dateianhang fehlgeschlagen: Kein Datei-Upload-Button oder Datei-Input im Compose-Bereich gefunden.");
+    }
+
+    // Prüfen, ob Klick direkt den FileChooser öffnet
+    const chooserPromise = page.waitForEvent('filechooser', { timeout: 2500 }).catch(() => null);
+    await attachBtn.click();
+    const fileChooser = await chooserPromise;
+
+    if (fileChooser) {
+      await fileChooser.setFiles(filePaths);
+    } else {
+      // Möglicherweise hat sich ein Dropdown/Flyout-Menü geöffnet ("Von diesem Gerät hochladen")
+      await page.waitForTimeout(600);
+      const menuSelectors = [
+        '[data-tid="upload-from-computer"]',
+        '[data-tid="attach-upload-from-computer"]',
+        '[role="menuitem"]:has-text("diesem Gerät")',
+        '[role="menuitem"]:has-text("this device")',
+        '[role="menuitem"]:has-text("Computer")',
+        '[role="menuitem"]:has-text("computer")',
+        '[role="menuitem"]:has-text("Gerät")',
+        'button:has-text("diesem Gerät")',
+        'button:has-text("this device")'
+      ];
+
+      let menuOption = null;
+      for (const sel of menuSelectors) {
+        menuOption = await page.$(sel);
+        if (menuOption) break;
+      }
+
+      if (menuOption) {
+        const [uploadChooser] = await Promise.all([
+          page.waitForEvent('filechooser', { timeout: 8000 }),
+          menuOption.click()
+        ]);
+        await uploadChooser.setFiles(filePaths);
+      } else {
+        // Eventuell wurde das input[type="file"] erst durch den Klick ins DOM gehängt
+        const lateInput = await page.$('input[type="file"]');
+        if (lateInput) {
+          await lateInput.setInputFiles(filePaths);
+        } else {
+          throw new Error("Dateianhang fehlgeschlagen: 'Von diesem Gerät hochladen'-Option im Menü nicht gefunden.");
+        }
+      }
+    }
+
+    await this.waitForAttachmentUpload(page, filePaths);
+  }
+
+  // Wartet auf das Fertigstellen des Uploads in Teams
+  async waitForAttachmentUpload(page, filePaths = []) {
+    await page.waitForTimeout(1200);
+
+    // Auf Verschwinden von Progressbars warten
+    try {
+      const progressbars = page.locator('[data-tid="chat-pane-compose"] [role="progressbar"], div[role="progressbar"]');
+      const count = await progressbars.count();
+      if (count > 0) {
+        await progressbars.first().waitFor({ state: 'detached', timeout: 60000 });
+      }
+    } catch (e) {}
+
+    // Sicherstellen, dass der Senden-Button aktiv / nicht disabled ist
+    await page.waitForFunction(() => {
+      const btn = document.querySelector('button[data-tid="send-message-button"], button[aria-label*="Send"], button[aria-label*="Senden"]');
+      return btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
+    }, { timeout: 15000 }).catch(() => null);
+
+    await page.waitForTimeout(800);
+  }
+
+  async inspectCompose(tenant = '') {
+    const t = browserManager.normalizeTenant(tenant);
+    const page = await this.getPage(t, true);
+
+    const activeChat = await this.getActiveChatTitle(page);
+
+    const inspectData = await page.evaluate(() => {
+      const fileInputs = Array.from(document.querySelectorAll('input[type="file"]')).map(i => ({
+        id: i.id || null,
+        name: i.name || null,
+        dataTid: i.getAttribute('data-tid') || null,
+        multiple: i.multiple,
+        accept: i.accept || null,
+        visible: i.offsetWidth > 0 && i.offsetHeight > 0
+      }));
+
+      const composeFooter = document.querySelector('[data-tid="chat-pane-compose-message-footer"], [data-tid="chat-pane-compose"]');
+      const composeButtons = composeFooter ? Array.from(composeFooter.querySelectorAll('button')).map(b => ({
+        dataTid: b.getAttribute('data-tid') || null,
+        ariaLabel: b.getAttribute('aria-label') || null,
+        title: b.getAttribute('title') || null,
+        innerText: b.innerText?.trim() || '',
+        disabled: b.disabled || b.getAttribute('aria-disabled') === 'true'
+      })) : [];
+
+      return {
+        hasComposeFooter: !!composeFooter,
+        fileInputs,
+        composeButtons
+      };
+    });
+
+    return {
+      tenant: t,
+      activeChat,
+      ...inspectData
+    };
+  }
+
+  async sendMessage(tenant = '', { message, chatName, attachments } = {}) {
     if (!message) throw new Error("Nachrichtentext (message) ist erforderlich.");
     if (!chatName) throw new Error("Empfänger (chat_name) ist erforderlich. Es wird bewusst nicht in einen unbestimmten 'aktiven' Chat gesendet.");
+    const validAttachments = this.validateAttachments(attachments);
     const t = browserManager.normalizeTenant(tenant);
     const page = await this.getPage(t, true);
 
@@ -433,6 +608,11 @@ export class TeamsClient {
     await this.insertTextViaPaste(page, message);
     await page.waitForTimeout(600);
 
+    // Anhänge hinzufügen, falls übergeben
+    if (validAttachments.length > 0) {
+      await this.attachFiles(page, validAttachments);
+    }
+
     const sendButton = await page.$('button[data-tid="send-message-button"], button[aria-label*="Send"], button[aria-label*="Senden"]');
     if (sendButton) {
       await sendButton.click();
@@ -456,7 +636,10 @@ export class TeamsClient {
       recipient: picked.title,
       confirmedActiveChat: activeChat,
       messageSent: message,
-      status: "Nachricht erfolgreich gesendet."
+      attachments: validAttachments.map(p => path.basename(p)),
+      status: validAttachments.length > 0
+        ? `Nachricht mit ${validAttachments.length} Anhang/Anhängen erfolgreich gesendet.`
+        : "Nachricht erfolgreich gesendet."
     };
   }
   async getMeetingStatus(tenant = '') {

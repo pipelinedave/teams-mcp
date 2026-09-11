@@ -133,7 +133,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'teams_send_message',
-        description: 'Sendet eine Nachricht in einen Microsoft Teams Chat.',
+        description: 'Sendet eine Nachricht in einen Microsoft Teams Chat (optional inklusive Dateianhängen).',
         inputSchema: {
           type: 'object',
           properties: {
@@ -145,9 +145,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'string',
               description: 'Name des Empfänger-Chats oder Kollegen'
             },
+            attachments: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Optionale Liste lokaler Dateipfade, die als Anhang mitgesendet werden sollen (z.B. ["/tmp/datei.zip"]).'
+            },
+            attachment: {
+              type: 'string',
+              description: 'Optionaler einzelner Dateipfad als Anhang (Alternative zu attachments).'
+            },
             tenant: tenantParam()
           },
           required: ['message']
+        }
+      },
+      {
+        name: 'teams_inspect',
+        description: 'Gibt technische Diagnose-Informationen über erkannte Teams-UI-Elemente, Chat-Pane, Compose-Footer, Buttons und Datei-Inputs zurück.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tenant: tenantParam()
+          }
         }
       },
       {
@@ -283,10 +302,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'teams_send_message': {
         const tenant = args?.tenant;
+        const rawAttachments = args?.attachments || (args?.attachment ? [args.attachment] : []);
         const result = await teamsClient.sendMessage(tenant, {
           message: args.message,
-          chatName: args.chat_name
+          chatName: args.chat_name,
+          attachments: rawAttachments
         });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+        };
+      }
+
+      case 'teams_inspect': {
+        const tenant = args?.tenant;
+        const result = await teamsClient.inspectCompose(tenant);
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
         };

@@ -16,8 +16,12 @@ und Nachrichten senden – jeweils in einem isolierten Browser-Profil pro Konto/
 
 - **Multi-Tenant**: Jeder Tenant/Account bekommt ein isoliertes Browser-Profil
   (`.teams-browser-profile-<tenant>`) – keine Session-Kollisionen.
-- **8 Tools**: `teams_status`, `teams_login`, `teams_list_chats`, `teams_get_messages`,
-  `teams_search`, `teams_list_teams`, `teams_send_message`, `teams_close`.
+- **Tools**: `teams_status`, `teams_login`, `teams_list_chats`, `teams_get_messages`,
+  `teams_search`, `teams_list_teams`, `teams_send_message`, `teams_inspect`, `teams_meeting_status`,
+  `teams_start_tracking`, `teams_stop_tracking`, `teams_close`.
+- **Dateianhänge unterstützen**: `teams_send_message` akzeptiert optionale lokale Dateipfade
+  (`attachments: ["/tmp/file.zip"]` oder `attachment: "/tmp/file.zip"`). Automatischer Upload via
+  FileChooser / Input-Bridge inklusive Upload-Fortschritts-Überwachung vor dem Versand.
 - **Konsistente Chat-Adressierung**: `chat_index` und `chat_name` lösen auf dieselbe
   Chat-Liste auf (kein falscher Chat durch DOM-Index-Versatz).
 - **Sichere Sendesemantik**: `teams_send_message` sendet nicht blind in den aktiven

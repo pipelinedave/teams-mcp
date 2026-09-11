@@ -168,3 +168,40 @@ describe('speakerTracker - Name cleaning & Event aggregation', () => {
     assert.equal(intervals[1].speaker, 'Mathis');
   });
 });
+
+describe('validateAttachments - Dateianhang-Validierung', () => {
+  test('leere oder nicht gesetzte Anhänge liefern leeres Array', () => {
+    assert.deepEqual(client.validateAttachments(null), []);
+    assert.deepEqual(client.validateAttachments(undefined), []);
+    assert.deepEqual(client.validateAttachments(''), []);
+    assert.deepEqual(client.validateAttachments([]), []);
+  });
+
+  test('existierende Datei wird zu absolutem Pfad normalisiert', () => {
+    const res = client.validateAttachments('package.json');
+    assert.equal(res.length, 1);
+    assert.ok(res[0].endsWith('package.json'));
+    assert.ok(res[0].startsWith('/'));
+  });
+
+  test('Array aus existierenden Dateien', () => {
+    const res = client.validateAttachments(['package.json', 'README.md']);
+    assert.equal(res.length, 2);
+    assert.ok(res[0].endsWith('package.json'));
+    assert.ok(res[1].endsWith('README.md'));
+  });
+
+  test('nicht existierende Datei wirft verständlichen Fehler', () => {
+    assert.throws(
+      () => client.validateAttachments('/tmp/nicht-existierende-datei-12345.xyz'),
+      /Anhang-Datei nicht gefunden/
+    );
+  });
+
+  test('Verzeichnis statt Datei wirft Fehler', () => {
+    assert.throws(
+      () => client.validateAttachments('src'),
+      /Anhang ist keine reguläre Datei/
+    );
+  });
+});
