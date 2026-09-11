@@ -12,6 +12,10 @@ function parseArgs(args) {
       parsed.options.tenant = args[++i];
     } else if (arg === '--out' || arg === '-o') {
       parsed.options.out = args[++i];
+    } else if (arg === '--meeting-url' || arg === '-u') {
+      parsed.options.meetingUrl = args[++i];
+    } else if (arg === '--no-join') {
+      parsed.options.noJoin = true;
     } else if (arg === '--help' || arg === '-h') {
       parsed.options.help = true;
     } else if (!arg.startsWith('-') && !parsed.command) {
@@ -28,13 +32,15 @@ Teams MCP - Active Speaker Tracker CLI
 
 Verwendung:
   node bin/track-speakers.js status [--tenant <name>]
-  node bin/track-speakers.js record [--tenant <name>] [--out <pfad/zu/meeting.speakers.json>]
+  node bin/track-speakers.js record [--tenant <name>] [--out <pfad/zu/meeting.speakers.json>] [--meeting-url <url>] [--no-join]
   node bin/track-speakers.js start  [--tenant <name>] [--out <pfad/zu/meeting.speakers.json>]
   node bin/track-speakers.js stop   [--tenant <name>]
 
 Optionen:
   --tenant, -t   Tenant-Name (z.B. adesso, dvelop; Standard: adesso)
   --out, -o      Ausgabepfad für die *.speakers.json (Standard: ./meeting.speakers.json)
+  --meeting-url, -u  Teams-Meeting-Link direkt angeben (sonst: auto aus Kalender)
+  --no-join      Nicht automatisch beitreten (nur tracken falls bereits im Meeting)
   --help, -h     Diese Hilfe anzeigen
 `);
 }
@@ -61,8 +67,14 @@ async function main() {
       case 'record': {
         const outPath = options.out ? path.resolve(options.out) : path.resolve(process.cwd(), `Meeting_${Date.now()}.speakers.json`);
         console.log(`[*] Starte Speaker Tracking (Live-Record) für Tenant '${tenant}'...`);
+        if (options.meetingUrl) console.log(`[*] Meeting-URL: ${options.meetingUrl}`);
+        else if (!options.noJoin) console.log(`[*] Suche aktuelles Meeting im Teams-Kalender...`);
         console.log(`[*] Zieldatei: ${outPath}`);
-        const res = await teamsClient.startSpeakerTracking(tenant, outPath);
+        const trackingOptions = {
+          meetingUrl: options.meetingUrl || null,
+          noJoin: options.noJoin || false,
+        };
+        const res = await teamsClient.startSpeakerTracking(tenant, outPath, trackingOptions);
         console.log(JSON.stringify(res, null, 2));
         console.log('[*] Tracking aktiv. Beenden mit Strg+C (SIGINT) oder Beenden des Elternprozesses.');
 
@@ -88,7 +100,11 @@ async function main() {
         const outPath = options.out ? path.resolve(options.out) : path.resolve(process.cwd(), `Meeting_${Date.now()}.speakers.json`);
         console.log(`[*] Starte Speaker Tracking für Tenant '${tenant}'...`);
         console.log(`[*] Zieldatei: ${outPath}`);
-        const res = await teamsClient.startSpeakerTracking(tenant, outPath);
+        const trackingOptions = {
+          meetingUrl: options.meetingUrl || null,
+          noJoin: options.noJoin || false,
+        };
+        const res = await teamsClient.startSpeakerTracking(tenant, outPath, trackingOptions);
         console.log(JSON.stringify(res, null, 2));
         process.exit(0);
         break;

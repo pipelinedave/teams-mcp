@@ -470,10 +470,10 @@ export class TeamsClient {
     };
   }
 
-  async startSpeakerTracking(tenant = '', outputPath = null) {
+  async startSpeakerTracking(tenant = '', outputPath = null, options = {}) {
     const t = browserManager.normalizeTenant(tenant);
     const page = await this.getPage(t, true);
-    return await speakerTracker.startTracking(page, t, outputPath);
+    return await speakerTracker.startTracking(page, t, outputPath, options);
   }
 
   async stopSpeakerTracking(tenant = '') {

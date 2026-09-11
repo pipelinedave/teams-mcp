@@ -168,12 +168,183 @@ export class SpeakerTracker {
     }));
   }
 
+
+  /**
+   * Handles the Teams pre-join screen: turns off mic + camera, clicks "Join now",
+   * and handles the "already in meeting from another device" dialog.
+   */
+  async _handlePreJoinScreen(page) {
+    // Wait for pre-join UI to appear
+    await page.waitForTimeout(3000);
+
+    // Turn off microphone if it's currently on (aria-pressed="true")
+    try {
+      const micBtn = await page.$(
+        'button[aria-pressed="true"][aria-label*="Mikrofon"], ' +
+        'button[aria-pressed="true"][aria-label*="Microphone"], ' +
+        'button[aria-pressed="true"][data-tid*="mic"], ' +
+        'button[aria-pressed="true"][data-tid*="mute"]'
+      );
+      if (micBtn) await micBtn.click();
+    } catch (_) {}
+
+    // Turn off camera if it's currently on
+    try {
+      const camBtn = await page.$(
+        'button[aria-pressed="true"][aria-label*="Kamera"], ' +
+        'button[aria-pressed="true"][aria-label*="Camera"], ' +
+        'button[aria-pressed="true"][aria-label*="video"], ' +
+        'button[aria-pressed="true"][data-tid*="video"]'
+      );
+      if (camBtn) await camBtn.click();
+    } catch (_) {}
+
+    await page.waitForTimeout(500);
+
+    // Click "Join now" / "Jetzt beitreten"
+    const joinNowSelectors = [
+      '[data-tid="prejoin-join-button"]',
+      'button[aria-label="Jetzt beitreten"]',
+      'button[aria-label="Join now"]',
+      'button:has-text("Jetzt beitreten")',
+      'button:has-text("Join now")',
+      'button:has-text("Beitreten")',
+    ];
+
+    for (const sel of joinNowSelectors) {
+      try {
+        await page.click(sel, { timeout: 4000 });
+        break;
+      } catch (_) {}
+    }
+
+    // Handle "already in meeting from another device" dialog
+    await page.waitForTimeout(2000);
+    const joinAnywaySelectors = [
+      'button:has-text("Trotzdem beitreten")',
+      'button:has-text("Join anyway")',
+      'button[aria-label*="Join anyway"]',
+      'button[aria-label*="Trotzdem"]',
+    ];
+    for (const sel of joinAnywaySelectors) {
+      try {
+        await page.click(sel, { timeout: 3000 });
+        break;
+      } catch (_) {}
+    }
+
+    // Give the meeting UI time to load
+    await page.waitForTimeout(4000);
+  }
+
+  /**
+   * Navigates to a specific Teams meeting URL and joins silently (mic + cam off).
+   */
+  async joinMeetingByUrl(page, meetingUrl) {
+    console.log(`[SpeakerTracker] Joining meeting by URL...`);
+    await page.goto(meetingUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await this._handlePreJoinScreen(page);
+    console.log(`[SpeakerTracker] Joined meeting.`);
+  }
+
+  /**
+   * Scans the Teams calendar for a currently running or about-to-start meeting
+   * and joins it silently (mic + cam off).
+   *
+   * Strategy:
+   *   1. Navigate to teams.microsoft.com (home/calendar)
+   *   2. Look for a visible "Beitreten" / "Join" button on a meeting card
+   *   3. OR extract a meetup-join link from the page
+   *   4. Click/navigate and call _handlePreJoinScreen
+   */
+  async findAndJoinNextMeeting(page) {
+    console.log(`[SpeakerTracker] Scanning Teams calendar for current/next meeting...`);
+
+    // Navigate to Teams calendar
+    await page.goto('https://teams.microsoft.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(3000);
+
+    // Try clicking the Calendar icon in the left nav
+    const calNavSelectors = [
+      '[data-tid="app-bar-calendar"]',
+      'button[aria-label="Kalender"]',
+      'button[aria-label="Calendar"]',
+      'a[aria-label="Kalender"]',
+      'a[aria-label="Calendar"]',
+      '[data-app-name="calendar"]',
+      'nav [title="Kalender"]',
+      'nav [title="Calendar"]',
+    ];
+    for (const sel of calNavSelectors) {
+      try {
+        await page.click(sel, { timeout: 3000 });
+        await page.waitForTimeout(2000);
+        break;
+      } catch (_) {}
+    }
+
+    // Look for a "Join" button on today's meeting cards (meetings happening now show one)
+    const joinBtnSelectors = [
+      'button[aria-label*="Beitreten"]',
+      'button[aria-label*="Join"]',
+      'button:has-text("Beitreten")',
+      'button:has-text("Join")',
+      '[data-tid*="join-btn"]',
+      '[data-tid*="joinBtn"]',
+    ];
+
+    for (const sel of joinBtnSelectors) {
+      try {
+        const btn = await page.$(sel);
+        if (btn) {
+          const visible = await btn.isVisible();
+          if (visible) {
+            console.log(`[SpeakerTracker] Found Join button, clicking...`);
+            await btn.click();
+            await this._handlePreJoinScreen(page);
+            console.log(`[SpeakerTracker] Successfully joined meeting from calendar.`);
+            return;
+          }
+        }
+      } catch (_) {}
+    }
+
+    // Fallback: extract a meetup-join link from the DOM
+    try {
+      const joinUrl = await page.evaluate(() => {
+        const links = Array.from(document.querySelectorAll('a[href*="meetup-join"], a[href*="teams.microsoft.com/l/"]'));
+        return links.length > 0 ? links[0].href : null;
+      });
+
+      if (joinUrl) {
+        console.log(`[SpeakerTracker] Found meeting link in DOM, navigating...`);
+        await page.goto(joinUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await this._handlePreJoinScreen(page);
+        console.log(`[SpeakerTracker] Successfully joined meeting via link.`);
+        return;
+      }
+    } catch (_) {}
+
+    // If nothing found: warn but don't crash — tracking will still work if user is already in a meeting tab
+    console.warn(`[SpeakerTracker] No joinable meeting found in Teams calendar. Continuing without auto-join.`);
+  }
+
   /**
    * Starts tracking active speakers in the given tenant's Teams tab.
    */
-  async startTracking(page, tenant, outputPath = null) {
+  async startTracking(page, tenant, outputPath = null, options = {}) {
     if (this.activeSessions.has(tenant)) {
       await this.stopTracking(tenant);
+    }
+
+    // Auto-join: navigate to meeting URL or find next meeting in calendar
+    const { meetingUrl, autoJoin = true, noJoin = false } = options;
+    if (!noJoin) {
+      if (meetingUrl) {
+        await this.joinMeetingByUrl(page, meetingUrl);
+      } else if (autoJoin) {
+        await this.findAndJoinNextMeeting(page);
+      }
     }
 
     const meetingInfo = await this.inspectMeeting(page);
