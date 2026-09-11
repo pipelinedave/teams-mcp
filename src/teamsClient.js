@@ -442,6 +442,11 @@ export class TeamsClient {
 
     // 2. Kaskade: Büroklammer / Attach-Button im Compose-Footer
     const attachButtonSelectors = [
+      'button[data-tid="newMessageCommands-FilePicker"]',
+      'button[data-tid*="FilePicker"]',
+      'button[aria-label*="Attach files" i]',
+      'button[aria-label*="Dateien anhängen" i]',
+      'button[aria-label*="Dateien anheften" i]',
       '[data-tid="chat-pane-compose-message-footer"] button[data-tid="attach-button"]',
       '[data-tid="chat-pane-compose-message-footer"] button[data-tid="compose-attach-button"]',
       '[data-tid="chat-pane-compose"] button[aria-label*="anhängen" i]',
@@ -526,7 +531,7 @@ export class TeamsClient {
 
     // Sicherstellen, dass der Senden-Button aktiv / nicht disabled ist
     await page.waitForFunction(() => {
-      const btn = document.querySelector('button[data-tid="send-message-button"], button[aria-label*="Send"], button[aria-label*="Senden"]');
+      const btn = document.querySelector('button[data-tid="newMessageCommands-send"], button[data-tid="send-message-button"], button[aria-label*="Send"], button[aria-label*="Senden"]');
       return btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
     }, { timeout: 15000 }).catch(() => null);
 
@@ -613,7 +618,7 @@ export class TeamsClient {
       await this.attachFiles(page, validAttachments);
     }
 
-    const sendButton = await page.$('button[data-tid="send-message-button"], button[aria-label*="Send"], button[aria-label*="Senden"]');
+    const sendButton = await page.$('button[data-tid="newMessageCommands-send"], button[data-tid="send-message-button"], button[aria-label*="Send"], button[aria-label*="Senden"]');
     if (sendButton) {
       await sendButton.click();
     } else {
