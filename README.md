@@ -22,8 +22,9 @@ und Nachrichten senden – jeweils in einem isolierten Browser-Profil pro Konto/
 - **Dateianhänge unterstützen**: `teams_send_message` akzeptiert optionale lokale Dateipfade
   (`attachments: ["/tmp/file.zip"]` oder `attachment: "/tmp/file.zip"`). Automatischer Upload via
   FileChooser / Input-Bridge inklusive Upload-Fortschritts-Überwachung vor dem Versand.
-- **Konsistente Chat-Adressierung**: `chat_index` und `chat_name` lösen auf dieselbe
-  Chat-Liste auf (kein falscher Chat durch DOM-Index-Versatz).
+- **Konsistente Chat- & Adressbuch-Auflösung**: `chat_index` und `chat_name` lösen auf
+  bestehende Chats auf. Ist ein Kollege noch nicht in der Chat-Liste, startet `teams_send_message`
+  vollautomatisch einen neuen Chat über das globale Unternehmensadressbuch (GAL / People-Picker).
 - **Sichere Sendesemantik**: `teams_send_message` sendet nicht blind in den aktiven
   Chat, wenn der Ziel-Chat nicht eindeutig gefunden wird – es wirft stattdessen einen Fehler.
   Vor dem Versand verifiziert ein **Sicherheitsnetz**, dass der tatsächlich geöffnete Chat dem
