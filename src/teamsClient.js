@@ -1,6 +1,7 @@
 import TurndownService from 'turndown';
 import { browserManager } from './browserManager.js';
 import { config } from './config.js';
+import { speakerTracker } from './speakerTracker.js';
 
 const turndown = new TurndownService({
   headingStyle: 'atx',
@@ -457,6 +458,27 @@ export class TeamsClient {
       messageSent: message,
       status: "Nachricht erfolgreich gesendet."
     };
+  }
+  async getMeetingStatus(tenant = '') {
+    const t = browserManager.normalizeTenant(tenant);
+    const page = await this.getPage(t, true);
+    const info = await speakerTracker.inspectMeeting(page);
+    return {
+      tenant: t,
+      ...info,
+      isTracking: speakerTracker.isTracking(t)
+    };
+  }
+
+  async startSpeakerTracking(tenant = '', outputPath = null) {
+    const t = browserManager.normalizeTenant(tenant);
+    const page = await this.getPage(t, true);
+    return await speakerTracker.startTracking(page, t, outputPath);
+  }
+
+  async stopSpeakerTracking(tenant = '') {
+    const t = browserManager.normalizeTenant(tenant);
+    return await speakerTracker.stopTracking(t);
   }
 }
 

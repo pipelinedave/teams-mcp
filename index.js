@@ -159,6 +159,40 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             tenant: tenantParam({ includeAll: true, def: 'all' })
           }
         }
+      },
+      {
+        name: 'teams_meeting_status',
+        description: 'Ermittelt den aktuellen Meeting- und Anrufstatus (inkl. Meeting-Titel, Teilnehmer und aktive Sprecher).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tenant: tenantParam()
+          }
+        }
+      },
+      {
+        name: 'teams_start_tracking',
+        description: 'Startet das DOM-basierte Active Speaker Tracking für das laufende Teams-Meeting.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tenant: tenantParam(),
+            output_path: {
+              type: 'string',
+              description: 'Optionaler Speicherpfad für die *.speakers.json (z.B. /pfad/meeting.speakers.json)'
+            }
+          }
+        }
+      },
+      {
+        name: 'teams_stop_tracking',
+        description: 'Beendet das Active Speaker Tracking und exportiert die Sprecher-Timeline (*.speakers.json).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tenant: tenantParam()
+          }
+        }
       }
     ]
   };
@@ -253,6 +287,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           message: args.message,
           chatName: args.chat_name
         });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+        };
+      }
+
+case 'teams_meeting_status': {
+        const tenant = args?.tenant;
+        const result = await teamsClient.getMeetingStatus(tenant);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+        };
+      }
+
+      case 'teams_start_tracking': {
+        const tenant = args?.tenant;
+        const result = await teamsClient.startSpeakerTracking(tenant, args?.output_path);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+        };
+      }
+
+      case 'teams_stop_tracking': {
+        const tenant = args?.tenant;
+        const result = await teamsClient.stopSpeakerTracking(tenant);
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
         };
