@@ -486,14 +486,28 @@ export class TeamsClient {
         '[role="menuitem"]:has-text("Computer")',
         '[role="menuitem"]:has-text("computer")',
         '[role="menuitem"]:has-text("Gerät")',
+        '[role="menuitem"]:has-text("Upload")',
         'button:has-text("diesem Gerät")',
-        'button:has-text("this device")'
+        'button:has-text("this device")',
+        'button:has-text("Upload")'
       ];
 
       let menuOption = null;
       for (const sel of menuSelectors) {
         menuOption = await page.$(sel);
         if (menuOption) break;
+      }
+
+      // Falls menuOption noch nicht gefunden: alle Menüeinträge per Text durchsuchen
+      if (!menuOption) {
+        const handle = await page.evaluateHandle(() => {
+          const items = Array.from(document.querySelectorAll('[role="menu"] [role="menuitem"], [role="menu"] button, div[role="menuitem"], div[class*="menu"] [role="menuitem"]'));
+          return items.find(el => {
+            const txt = (el.innerText || el.textContent || '').toLowerCase();
+            return txt.includes('gerät') || txt.includes('device') || txt.includes('computer') || txt.includes('upload');
+          }) || null;
+        });
+        menuOption = handle.asElement();
       }
 
       if (menuOption) {
