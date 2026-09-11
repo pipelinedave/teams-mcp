@@ -591,6 +591,63 @@ export class TeamsClient {
     };
   }
 
+  // Startet einen neuen Chat über das To:-Feld (Adressbuch/GAL), falls kein bestehender Chat vorhanden ist
+  async startNewChat(page, personName) {
+    // 1. Zuerst sicherstellen, dass wir in der Chat-App sind (Ctrl+Shift+4)
+    await page.keyboard.press('Control+Shift+4');
+    await page.waitForTimeout(1000);
+
+    // 2. Neuer Chat per Shortcut Alt+Shift+N oder Button
+    const newMsgBtn = await page.$('button[aria-label*="New message" i], button[aria-label*="Neuer Chat" i]');
+    if (newMsgBtn) {
+      await newMsgBtn.click();
+    } else {
+      await page.keyboard.press('Alt+Shift+N');
+    }
+    await page.waitForTimeout(1500);
+
+    // 3. To-Input finden
+    const toInput = await page.$(
+      'input[aria-label*="name" i], input[placeholder*="name" i], input[aria-label*="Namen" i], input[placeholder*="Namen" i], input[data-tid*="people-picker"]'
+    );
+    if (!toInput) return null;
+
+    await toInput.click();
+    await toInput.fill('');
+    await toInput.type(personName, { delay: 60 });
+    await page.waitForTimeout(2000);
+
+    // 4. Suggestions abwarten
+    const optionLocator = page.locator('[role="listbox"] [role="option"], [role="option"], [data-tid*="suggestion"]');
+    await optionLocator.first().waitFor({ state: 'visible', timeout: 8000 }).catch(() => null);
+
+    const count = await optionLocator.count();
+    if (count === 0) return null;
+
+    // Finde passende Option
+    let targetOption = null;
+    let pickedTitle = personName;
+    const norm = personName.toLowerCase();
+    for (let i = 0; i < count; i++) {
+      const opt = optionLocator.nth(i);
+      const text = (await opt.innerText().catch(() => '')) || '';
+      if (text.toLowerCase().includes(norm)) {
+        targetOption = opt;
+        pickedTitle = text.split('\n')[0].trim();
+        break;
+      }
+    }
+    if (!targetOption) {
+      targetOption = optionLocator.first();
+      const text = (await targetOption.innerText().catch(() => '')) || '';
+      if (text) pickedTitle = text.split('\n')[0].trim();
+    }
+
+    await targetOption.click();
+    await page.waitForTimeout(2500);
+    return { title: pickedTitle };
+  }
+
   async sendMessage(tenant = '', { message, chatName, attachments } = {}) {
     if (!message) throw new Error("Nachrichtentext (message) ist erforderlich.");
     if (!chatName) throw new Error("Empfänger (chat_name) ist erforderlich. Es wird bewusst nicht in einen unbestimmten 'aktiven' Chat gesendet.");
@@ -600,13 +657,18 @@ export class TeamsClient {
 
     const filtered = await this.getFilteredChatRows(page);
 
-    const picked = this.pickChatRow(filtered, chatName, undefined);
+    let picked = this.pickChatRow(filtered, chatName, undefined);
     if (!picked) {
-      throw new Error(`Chat '${chatName}' wurde in Teams (${t}) nicht gefunden. Keine Nachricht gesendet (verhindert Fehlversand).`);
+      // Chat nicht in den geladenen Zeilen -> versuche neuen Chat über das Adressbuch
+      const newChatResult = await this.startNewChat(page, chatName);
+      if (!newChatResult) {
+        throw new Error(`Chat oder Kollege '${chatName}' wurde in Teams (${t}) weder in bestehenden Chats noch im Adressbuch gefunden.`);
+      }
+      picked = newChatResult;
+    } else {
+      await picked.row.click();
+      await page.waitForTimeout(2500);
     }
-
-    await picked.row.click();
-    await page.waitForTimeout(2500);
 
     // Compose-Feld GEZIELT im geöffneten Chat-Pane finden. WICHTIG: Darf NICHT das
     // globale div[role="textbox"] verwenden, sonst greift der Klick auf das
@@ -645,7 +707,9 @@ export class TeamsClient {
     // Verifizieren, dass der aktive Chat dem Ziel entspricht (Sicherheitsnetz)
     const targetNorm = picked.title.toLowerCase().replace(/ \(you\)$/i, '');
     const activeNorm = activeChat.toLowerCase().replace(/ \(you\)$/i, '');
-    if (!activeNorm.includes(targetNorm) && !targetNorm.includes(activeNorm)) {
+    const nameParts = targetNorm.split(/\s+/).filter(p => p.length > 2);
+    const matchAny = nameParts.some(p => activeNorm.includes(p));
+    if (!activeNorm.includes(targetNorm) && !targetNorm.includes(activeNorm) && !matchAny) {
       throw new Error(`Sicherheitsnetz: Der geöffnete Chat-Titel '${activeChat}' stimmt nicht mit Ziel '${picked.title}' überein. Nachricht wurde NICHT gesendet.`);
     }
 
