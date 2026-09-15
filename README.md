@@ -152,13 +152,20 @@ Drei-Schichten-Architektur:
   - `action: "stop"` – deaktiviert den Scheduler
   - `action: "run-once"` – führt sofort eine volle Analyse+Bericht aus (On-Demand)
   - `action: "config"` – zeigt die aktuelle Konfiguration an
+- `teams_list_pending_deliveries` – Listet noch nicht zugestellte (pending) Activity-Berichte
+  aus der Zustell-Outbox (`reports/outbox/`) auf — für den `tim`-Agenten, damit er weiss,
+  welcher Bericht an den Nutzer präsentiert werden soll (chronologisch, inkl. Report-Text).
+- `teams_mark_delivered` – Markiert eine Outbox-Zustellung (aus `teams_list_pending_deliveries`)
+  als übergeben (rename auf `*.delivered.json`), sodass kein Doppel-Versand erfolgt.
 
 **Kategorien** (breite Content-Range des Feeds): Der Klassifikator sortiert eingehende
 Einträge in die fünf Kategorien. `Risiko` (Blocker, Fehler, Fristrisiko) und `Task`
 (Aufgaben/Anfragen) werden als `hoch` priorisiert, `Entscheidung` und `Meeting` als
 `mittel`, der Rest als `niedrig`. Jeder Lauf speichert einen Markdown-Report nach
-`reports/` – der Bericht wird über den `tim`-Agenten als proaktive Präsentation an den
-Nutzer zugestellt (der Default-Sender schreibt auf stderr/Konsole).
+`reports/` und legt eine strukturierte **Zustell-Nachricht** in `reports/outbox/` ab.
+Der `tim`-Agent holt diese via `teams_list_pending_deliveries` ab, präsentiert den Bericht
+proaktiv an den Nutzer (im "Chat mit mir") und markiert ihn via `teams_mark_delivered`
+als übergeben — robuste Zustell-Kette ohne Prozesskopplung zwischen MCP-Server und Agent.
 
 **Verifizierte Konfiguration (Stand 16.09.2026):** Ein Smoke-Test über das MCP-Protokoll
 (`tools/list` + `tools/call` mit `action:"status"`) bestätigt: `teams_schedule_activity_report`
