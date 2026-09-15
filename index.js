@@ -9,6 +9,13 @@ import {
 import { browserManager } from './src/browserManager.js';
 import { teamsClient } from './src/teamsClient.js';
 import { config } from './src/config.js';
+import { ActivityReportScheduler, DEFAULT_SCHEDULE, runSchedulerControl } from './src/activityReportScheduler.js';
+
+// Singleton-Scheduler für den MCP-Server-Prozess: start/stop/status/run-once
+// greifen auf dieselbe Instanz zu, sodass die proaktive 2x/Tag-Pipeline zentral
+// gesteuert wird. Der Default-Sender schreibt auf stderr (Konsole) — die eigentliche
+// Zustellung/Präsentation des Berichts an den Nutzer übernimmt der tim-Agent.
+const activityScheduler = new ActivityReportScheduler({ tenant: config.defaultTenant || 'adesso' });
 
 const server = new Server(
   {
@@ -272,6 +279,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             }
           }
         }
+      },
+      {
+        name: 'teams_schedule_activity_report',
+        description: 'Steuert den geplanten proaktiven Activity-Bericht (2x/Tag via ActivityReportScheduler). Aktionen: "status" (aktueller Zustand/Konfig), "start" (Scheduler aktivieren), "stop" (deaktivieren), "run-once" (sofort eine volle Analyse+Bericht ausführen), "config" (Zeiten/Konfig anzeigen). Der erzeugte Markdown-Report landet in reports/activity-*-TIMESTAMP.md und wird via tim-Agent als proaktiver Bericht präsentiert.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: {
+              type: 'string',
+              enum: ['status', 'start', 'stop', 'run-once', 'config'],
+              description: 'Aktion (Standard: status)'
+            },
+            tenant: tenantParam(),
+            times: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Optionale Feuerszeiten HH:MM (nur bei action=start, Standard: [' + DEFAULT_SCHEDULE.join(', ') + '])'
+            },
+            max_items: {
+              type: 'number',
+              description: 'Maximale Anzahl extrahierter Activity-Items (Standard: 50)'
+            }
+          }
+        }
       }
     ]
   };
@@ -442,6 +473,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case 'teams_schedule_activity_report': {
+        const action = args?.action || 'status';
+        return await handleScheduleActivityReport(action, args);
+      }
+
       case 'teams_close': {
         const tenant = args?.tenant || 'all';
         await browserManager.close(tenant);
@@ -466,9 +502,122 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
+/**
+ * Handler für teams_schedule_activity_report.
+ *
+ * Steuert den Singleton-Scheduler "activityScheduler" (start/stop/status/run-once/config).
+ * Fehler (z.B. kein Tenant, Browser nicht erreichbar bei run-once) werden als Fehlermeldung
+ * zurückgegeben, nicht geworfen — der MCP-Kanal bleibt stabil.
+ *
+ * @param {string} action
+ * @param {object} args
+ * @returns {Promise<{content: Array<{type: string, text: string}>}>}
+ */
+async function handleScheduleActivityReport(action, args) {
+  // Konfiguration ggf. anpassen (tenant + maxItems + times)
+  const wantTenant = args?.tenant ? resolveTenant(args.tenant) : activityScheduler.tenant;
+  const wantMax = args?.max_items || activityScheduler.maxItems;
+  const applyConfig = () => {
+    let changed = false;
+    if (wantTenant !== activityScheduler.tenant) { activityScheduler.tenant = wantTenant; changed = true; }
+    if (wantMax !== activityScheduler.maxItems) { activityScheduler.maxItems = wantMax; changed = true; }
+    if (Array.isArray(args?.times) && args.times.length) { activityScheduler.times = args.times.filter((t) => !isNaN(toMinutes(t))); changed = true; }
+    return changed;
+  };
+
+  switch (action) {
+    case 'status': {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            running: activityScheduler._running,
+            tenant: activityScheduler.tenant,
+            times: activityScheduler.times,
+            maxItems: activityScheduler.maxItems,
+            topN: activityScheduler.topN,
+            lastFired: activityScheduler._lastFired,
+            reportsDir: `${activityScheduler.dir}/reports`
+          }, null, 2)
+        }]
+      };
+    }
+
+    case 'config': {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            running: activityScheduler._running,
+            tenant: activityScheduler.tenant,
+            times: activityScheduler.times,
+            maxItems: activityScheduler.maxItems,
+            topN: activityScheduler.topN,
+            dir: activityScheduler.dir
+          }, null, 2)
+        }]
+      };
+    }
+
+    case 'start': {
+      applyConfig();
+      if (activityScheduler._running) {
+        return { content: [{ type: 'text', text: JSON.stringify({ started: false, alreadyRunning: true, times: activityScheduler.times }, null, 2) }] };
+      }
+      activityScheduler.start();
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ started: true, times: activityScheduler.times, tenant: activityScheduler.tenant }, null, 2)
+        }]
+      };
+    }
+
+    case 'stop': {
+      activityScheduler.stop();
+      return { content: [{ type: 'text', text: JSON.stringify({ stopped: true }, null, 2) }] };
+    }
+
+    case 'run-once': {
+      applyConfig();
+      const out = await activityScheduler.runOnce();
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            date: out.date,
+            tenant: out.tenant,
+            counts: out.counts,
+            filePath: out.filePath,
+            stampedFile: out.stampedFile,
+            report: out.report
+          }, null, 2)
+        }]
+      };
+    }
+
+    default:
+      return { content: [{ type: 'text', text: JSON.stringify({ error: `Unbekannte Aktion: ${action}` }, null, 2) }] };
+  }
+}
+
 async function run() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // Geplanter proaktiver Activity-Bericht (2x täglich, Standard 09:00 + 17:00).
+  // Der Singleton-Scheduler (activityScheduler) wird beim Serverstart automatisch
+  // gestartet, sofern per TEAMS_MCP_ACTIVITY_SCHEDULER nicht deaktiviert (Standard: an).
+  // Zeiten per TEAMS_MCP_ACTIVITY_TIMES überschreibbar. Der Bericht landet in
+  // reports/ und wird per stderr (Konsole) ausgegeben; die Zustellung übernimmt der
+  // tim-Agent. Jederzeit über teams_schedule_activity_report (status/stop/...) steuerbar.
+  if (config.activitySchedulerEnabled && !activityScheduler._running) {
+    const times = config.activityTimes || DEFAULT_SCHEDULE;
+    if (times.length && times.join() !== activityScheduler.times.join()) {
+      activityScheduler.times = times;
+    }
+    activityScheduler.start();
+  }
 }
 
 run().catch((err) => {

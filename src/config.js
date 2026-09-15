@@ -94,6 +94,22 @@ function getDefaultHeadless() {
   return String(v).toLowerCase() !== 'false' && v !== '0';
 }
 
+// Aktivität-Scheduler: geplanter proaktiver Activity-Bericht (Standard 09:00 + 17:00).
+// Per TEAMS_MCP_ACTIVITY_SCHEDULER=0/false deaktivierbar; Times per
+// TEAMS_MCP_ACTIVITY_TIMES (Komma-getrennt HH:MM) überschreibbar.
+function getActivitySchedulerEnabled() {
+  const v = process.env.TEAMS_MCP_ACTIVITY_SCHEDULER;
+  if (v === undefined) return true;
+  return String(v).toLowerCase() !== 'false' && v !== '0';
+}
+
+function getActivityTimes() {
+  if (!process.env.TEAMS_MCP_ACTIVITY_TIMES) return null;
+  return process.env.TEAMS_MCP_ACTIVITY_TIMES.split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 const detectedChromePath = detectChromePath();
 if (!detectedChromePath) {
   console.warn('[teams-mcp] Kein Chrome/Chromium/Edge automatisch gefunden. Setze TEAMS_MCP_CHROME_PATH, falls Playwright keinen eigenen Browser mitbringt.');
@@ -108,5 +124,7 @@ export const config = {
   tenants: getTenants(),
   defaultTenant: getDefaultTenant(),
   selfName: getSelfName(),
-  defaultHeadless: getDefaultHeadless()
+  defaultHeadless: getDefaultHeadless(),
+  activitySchedulerEnabled: getActivitySchedulerEnabled(),
+  activityTimes: getActivityTimes()
 };
