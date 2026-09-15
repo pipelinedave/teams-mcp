@@ -19,6 +19,10 @@ und Nachrichten senden – jeweils in einem isolierten Browser-Profil pro Konto/
 - **Tools**: `teams_status`, `teams_login`, `teams_list_chats`, `teams_get_messages`,
   `teams_search`, `teams_list_teams`, `teams_send_message`, `teams_inspect`, `teams_meeting_status`,
   `teams_start_tracking`, `teams_stop_tracking`, `teams_close`.
+- **Aktivitätstab-Analyse**: `teams_get_activity` (Roh-Extraktion), `teams_analyze_activity`
+  (Klassifikation), `teams_generate_activity_report` (täglicher Markdown-Report) und
+  `teams_schedule_activity_report` (geplanter proaktiver Lauf 2x/Tag) – siehe Abschnitt
+  [Aktivitätstab-Analyse & Bericht](#aktivitätstab-analyse--bericht).
 - **Dateianhänge unterstützen**: `teams_send_message` akzeptiert optionale lokale Dateipfade
   (`attachments: ["/tmp/file.zip"]` oder `attachment: "/tmp/file.zip"`). Automatischer Upload via
   FileChooser / Input-Bridge inklusive Upload-Fortschritts-Überwachung vor dem Versand.
