@@ -127,6 +127,39 @@ Für andere MCP-Clients (Claude Desktop, Cursor, …) starte den Server entsprec
   zweite parallele Agenten-Session), wartet der Server mit Backoff und wirft sonst eine
   klare Meldung.
 
+## Aktivitätstab-Analyse & Bericht
+
+Das Toolset kann den Teams-**Aktivitätstab** systematisch auslesen, klassifizieren und dir
+als **proaktiven Bericht** präsentieren – damit du den Tab nicht selbst anklicken musst.
+Drei-Schichten-Architektur:
+
+| Schicht | Datei | Zweck |
+|---|---|---|
+| Layer 1 – Extraktion | `src/activityClient.js` | Reads the Activity-Feed (scroll-enabled) und liefert Roh-Items (Text, Autor, Zeitstempel) |
+| Layer 2 – Analyse | `src/activityAnalyzer.js` | Klassifiziert Einträge in **Meeting, Task, Entscheidung, Risiko, Sonstiges** mit Relevanz-Score + erzeugt Markdown-Report |
+| Layer 3 – Planung | `src/activityReportScheduler.js` | Geplanter proaktiver Lauf 2x/Tag + Steuerung |
+
+**Tools:**
+
+- `teams_get_activity` – Roh-Items aus dem Aktivitätstab (ohne Klassifikation).
+- `teams_analyze_activity` – Extrahiert + klassifiziert, liefert gruppierte Analyse (ohne Datei).
+- `teams_generate_activity_report` – Extrahiert + klassifiziert + speichert täglichen
+  Markdown-Report nach `reports/activity-summary-YYYY-MM-DD.md` (Top-3 je Kategorie, nach Relevanz).
+- `teams_schedule_activity_report` – Steuert den geplanten proaktiven Lauf:
+  - `action: "status"` – aktueller Scheduler-Zustand (Running? Zeiten? letzter Lauf?)
+  - `action: "start"` – aktiviert den 2x/Tag-Scheduler (Standard `["09:00","17:00"]`),
+    optional mit `times`, `tenant`, `max_items`
+  - `action: "stop"` – deaktiviert den Scheduler
+  - `action: "run-once"` – führt sofort eine volle Analyse+Bericht aus (On-Demand)
+  - `action: "config"` – zeigt die aktuelle Konfiguration an
+
+**Kategorien** (breite Content-Range des Feeds): Der Klassifikator sortiert eingehende
+Einträge in die fünf Kategorien. `Risiko` (Blocker, Fehler, Fristrisiko) und `Task`
+(Aufgaben/Anfragen) werden als `hoch` priorisiert, `Entscheidung` und `Meeting` als
+`mittel`, der Rest als `niedrig`. Jeder Lauf speichert einen Markdown-Report nach
+`reports/` – der Bericht wird über den `tim`-Agenten als proaktive Präsentation an den
+Nutzer zugestellt (der Default-Sender schreibt auf stderr/Konsole).
+
 ## Projektstruktur
 
 ```
@@ -135,7 +168,11 @@ teams-mcp/
 ├── src/
 │   ├── config.js          # Zentrale, per Env überschreibbare Konfiguration
 │   ├── browserManager.js  # Playwright-Profil-Management (Multi-Tenant, Locks)
-│   └── teamsClient.js     # Teams-Web-Automation (Chats, Messages, Search, Send)
+│   ├── teamsClient.js     # Teams-Web-Automation (Chats, Messages, Search, Send)
+│   ├── activityClient.js  # Layer 1: Activity-Feed-Extraktion
+│   ├── activityAnalyzer.js# Layer 2: Klassifikation + Report-Pipeline
+│   ├── activityReportScheduler.js # Layer 3: geplanter proaktiver Lauf
+│   └── speakerTracker.js  # Active Speaker Tracking (Meetings)
 └── package.json
 ```
 
@@ -167,6 +204,13 @@ npm run test:integration          # LANGSAM, sendet NICHT (Standard: Sende-Test 
 
 Der Integrationstest prüft `status`, `list_chats` (Index-Konsistenz), `get_messages`
 (Name↔Index-Auflösung), `search`, `list_teams` und `send_message`.
+
+**Aktivität-Demos** (ohne echten Browser, mit Beispiel-/Simulationsdaten):
+
+```bash
+node tests/activity-analyzer.demo.mjs     # Layer 2: Klassifikation + Report
+node tests/scheduler.demo.mjs             # Layer 3: Scheduler-Pipeline (simuliert)
+```
 
 > ⚠️ **Sicherheit beim Senden**: Standardmäßig wird der Sende-Teil des Integrationstests
 > **übersprungen**. Nur wenn du ihn explizit freigibst UND als Empfänger deinen eigenen
