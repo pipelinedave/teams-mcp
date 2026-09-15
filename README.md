@@ -187,6 +187,7 @@ teams-mcp/
 │   ├── activityClient.js  # Layer 1: Activity-Feed-Extraktion
 │   ├── activityAnalyzer.js# Layer 2: Klassifikation + Report-Pipeline
 │   ├── activityReportScheduler.js # Layer 3: geplanter proaktiver Lauf
+│   ├── reportDelivery.js  # Zustellebene: Outbox für den tim-Agenten
 │   └── speakerTracker.js  # Active Speaker Tracking (Meetings)
 └── package.json
 ```
