@@ -138,6 +138,7 @@ Drei-Schichten-Architektur:
 | Layer 1 – Extraktion | `src/activityClient.js` | Reads the Activity-Feed (scroll-enabled) und liefert Roh-Items (Text, Autor, Zeitstempel) |
 | Layer 2 – Analyse | `src/activityAnalyzer.js` | Klassifiziert Einträge in **Meeting, Task, Entscheidung, Risiko, Sonstiges** mit Relevanz-Score + erzeugt Markdown-Report |
 | Layer 3 – Planung | `src/activityReportScheduler.js` | Geplanter proaktiver Lauf 2x/Tag + Steuerung |
+| Layer 4 – Zustellung | `src/reportDelivery.js` | Outbox für den `tim`-Agenten (`teams_list_pending_deliveries` / `teams_mark_delivered`) |
 
 **Tools:**
 
@@ -224,8 +225,10 @@ Der Integrationstest prüft `status`, `list_chats` (Index-Konsistenz), `get_mess
 **Aktivität-Demos** (ohne echten Browser, mit Beispiel-/Simulationsdaten):
 
 ```bash
-node tests/activity-analyzer.demo.mjs     # Layer 2: Klassifikation + Report
-node tests/scheduler.demo.mjs             # Layer 3: Scheduler-Pipeline (simuliert)
+node tests/activity.demo.mjs                # Layer 1: Activity-Feed-Extraktion (Mock)
+node tests/activity-analyzer.demo.mjs       # Layer 2: Klassifikation + Report
+node tests/scheduler.demo.mjs               # Layer 3: Scheduler-Pipeline (simuliert)
+node tests/report-delivery.demo.mjs         # Zustellebene: Outbox -> tim-Agent -> übergeben
 ```
 
 > ⚠️ **Sicherheit beim Senden**: Standardmäßig wird der Sende-Teil des Integrationstests
