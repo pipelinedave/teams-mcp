@@ -10,12 +10,18 @@ import { browserManager } from './src/browserManager.js';
 import { teamsClient } from './src/teamsClient.js';
 import { config } from './src/config.js';
 import { ActivityReportScheduler, DEFAULT_SCHEDULE, runSchedulerControl } from './src/activityReportScheduler.js';
+import { createOutboxSender, listPendingDeliveries, markDelivered } from './src/reportDelivery.js';
 
 // Singleton-Scheduler für den MCP-Server-Prozess: start/stop/status/run-once
 // greifen auf dieselbe Instanz zu, sodass die proaktive 2x/Tag-Pipeline zentral
-// gesteuert wird. Der Default-Sender schreibt auf stderr (Konsole) — die eigentliche
-// Zustellung/Präsentation des Berichts an den Nutzer übernimmt der tim-Agent.
-const activityScheduler = new ActivityReportScheduler({ tenant: config.defaultTenant || 'adesso' });
+// gesteuert wird. Der Sender legt den Bericht als strukturierte Nachricht in der
+// Zustell-Outbox ab (reports/outbox/activity-delivery-*.json). Der tim-Agent holt
+// diese via teams_list_pending_deliveries ab, präsentiert sie David und markiert sie
+// via teams_mark_delivered als übergeben — robuste Kette ohne Prozesskopplung.
+const activityScheduler = new ActivityReportScheduler({
+  tenant: config.defaultTenant || 'adesso',
+  sender: createOutboxSender()
+});
 
 const server = new Server(
   {
@@ -303,6 +309,33 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             }
           }
         }
+      },
+      {
+        name: 'teams_list_pending_deliveries',
+        description: 'Listet noch nicht zugestellte (pending) Activity-Berichte aus der Zustell-Outbox (reports/outbox/) auf — für den tim-Agenten, damit er weiss, welcher Bericht an den Nutzer präsentiert werden soll. Chronologisch aufsteigend, inklusive Bericht-Text (report), counts, Tenant und Datum.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            include_delivered: {
+              type: 'boolean',
+              description: 'Auch bereits übergebene (delivered) Nachrichten auflisten? (Standard: false)'
+            }
+          }
+        }
+      },
+      {
+        name: 'teams_mark_delivered',
+        description: 'Markiert eine Outbox-Zustellung (Aus teams_list_pending_deliveries) als übergeben. Renamed die Datei auf *.delivered.json, sodass sie künftig nicht erneut gelistet wird (kein Doppel-Versand an den Nutzer).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            file: {
+              type: 'string',
+              description: 'Voller Pfad einer Outbox-Datei (aus teams_list_pending_deliveries)'
+            }
+          },
+          required: ['file']
+        }
       }
     ]
   };
@@ -476,6 +509,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'teams_schedule_activity_report': {
         const action = args?.action || 'status';
         return await handleScheduleActivityReport(action, args);
+      }
+
+      case 'teams_list_pending_deliveries': {
+        const pending = listPendingDeliveries({ includeDelivered: !!args?.include_delivered });
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              count: pending.length,
+              deliveries: pending.map(({ file, delivery }) => ({
+                file,
+                kind: delivery.kind,
+                recipient: delivery.recipient,
+                tenant: delivery.tenant,
+                date: delivery.date,
+                createdAt: delivery.createdAt,
+                counts: delivery.counts,
+                delivered: delivery.delivered,
+                report: delivery.report
+              }))
+            }, null, 2)
+          }]
+        };
+      }
+
+      case 'teams_mark_delivered': {
+        const file = args?.file;
+        if (!file) {
+          return { content: [{ type: 'text', text: JSON.stringify({ error: 'file ist erforderlich (Pfad aus teams_list_pending_deliveries)' }, null, 2) }] };
+        }
+        const res = markDelivered(file);
+        return { content: [{ type: 'text', text: JSON.stringify({ delivered: res.delivered, file: res.file }, null, 2) }] };
       }
 
       case 'teams_close': {

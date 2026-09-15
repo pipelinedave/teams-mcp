@@ -9,6 +9,7 @@ import { cleanSpeakerName, aggregateEvents, isBotOrUiName } from '../src/speaker
 import { extractActivityFromDom } from '../src/activityClient.js';
 import { classify, analyzeItems, buildReportText, writeReport, CATEGORIES } from '../src/activityAnalyzer.js';
 import { toMinutes, writeTimestampedReport, ActivityReportScheduler, DEFAULT_SCHEDULE, runSchedulerControl } from '../src/activityReportScheduler.js';
+import { createOutboxSender, listPendingDeliveries, markDelivered, DELIVERY_KIND, DELIVERY_RECIPIENT } from '../src/reportDelivery.js';
 
 // Instanz des TeamsClient (nur zur Nutzung der puren pickChatRow-Methode)
 const client = new TeamsClient();
@@ -96,7 +97,6 @@ describe('normalizeTenant / realm - Org-neutrale Tenant-Logik', () => {
     assert.equal(browserManager.normalizeTenant('all'), 'adesso');
   });
 });
-
 
 describe('speakerTracker - Name cleaning & Event aggregation', () => {
   test('cleanSpeakerName entfernt Rollen-Suffixe', () => {
@@ -713,5 +713,77 @@ describe('runSchedulerControl - zentrale Scheduler-Steuerung (MCP-Tool)', () => 
     const res = await runSchedulerControl({ action: 'kaputt', scheduler: new ActivityReportScheduler({}) });
     assert.ok(res.error);
     assert.match(res.error, /Unbekannte Aktion/);
+  });
+});
+
+describe('reportDelivery - Zustell-Outbox für den tim-Agenten', () => {
+  test('createOutboxSender schreibt strukturierte Nachricht in reports/outbox/', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'teams-delivery-'));
+    const now = new Date(2026, 8, 16, 9, 5); // 16.09.2026 09:05
+    const sender = createOutboxSender({ dir: tmpDir, now });
+    const out = await sender({
+      tenant: 'adesso',
+      date: '2026-09-16',
+      report: '# Test Bericht',
+      counts: { Meeting: 0, Task: 2, Entscheidung: 0, Risiko: 0, Sonstiges: 0 },
+      filePath: path.join(tmpDir, 'reports', 'activity-summary-2026-09-16.md')
+    });
+
+    assert.ok(out.outboxFile.endsWith(`reports${path.sep}outbox${path.sep}activity-delivery-2026-09-16-0905.json`));
+    const delivery = JSON.parse(fs.readFileSync(out.outboxFile, 'utf8'));
+    assert.equal(delivery.kind, DELIVERY_KIND);
+    assert.equal(delivery.recipient, DELIVERY_RECIPIENT);
+    assert.equal(delivery.tenant, 'adesso');
+    assert.equal(delivery.date, '2026-09-16');
+    assert.equal(delivery.report, '# Test Bericht');
+    assert.equal(delivery.delivered, false);
+    assert.deepEqual(delivery.counts, { Meeting: 0, Task: 2, Entscheidung: 0, Risiko: 0, Sonstiges: 0 });
+  });
+
+  test('createOutboxSender wirft, wenn result.report fehlt', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'teams-delivery-'));
+    const sender = createOutboxSender({ dir: tmpDir });
+    await assert.rejects(() => sender({ tenant: 'adesso' }), /keinen \.report/);
+  });
+
+  test('listPendingDeliveries listet nur nicht-übergebene Nachrichten chronologisch', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'teams-delivery-'));
+    const now1 = new Date(2026, 8, 16, 9, 0);
+    const now2 = new Date(2026, 8, 16, 17, 0);
+    await createOutboxSender({ dir: tmpDir, now: now1 })({ tenant: 'adesso', date: '2026-09-16', report: '# A', counts: {} });
+    const second = await createOutboxSender({ dir: tmpDir, now: now2 })({ tenant: 'adesso', date: '2026-09-16', report: '# B', counts: {} });
+
+    // zweite markieren, erste bleibt pending
+    markDelivered(second.outboxFile);
+
+    const pending = listPendingDeliveries({ dir: tmpDir });
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0].delivery.report, '# A');
+    assert.equal(pending[0].delivery.delivered, false);
+
+    const all = listPendingDeliveries({ dir: tmpDir, includeDelivered: true });
+    assert.equal(all.length, 2);
+  });
+
+  test('markDelivered benennt Datei um und verhindert Doppel-Zustellung', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'teams-delivery-'));
+    const file = path.join(tmpDir, 'reports', 'outbox', 'activity-delivery-2026-09-16-0900.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ delivered: false }), 'utf8');
+
+    const res = markDelivered(file);
+    assert.equal(res.delivered, true);
+    assert.ok(res.file.endsWith('.delivered.json'));
+    assert.ok(!fs.existsSync(file));
+    assert.ok(fs.existsSync(res.file));
+
+    // erneut markieren = no-op
+    const again = markDelivered(res.file);
+    assert.equal(again.delivered, false);
+  });
+
+  test('listPendingDeliveries liefert [] wenn Outbox fehlt', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'teams-delivery-'));
+    assert.deepEqual(listPendingDeliveries({ dir: tmpDir }), []);
   });
 });
