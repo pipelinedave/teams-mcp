@@ -160,6 +160,14 @@ Einträge in die fünf Kategorien. `Risiko` (Blocker, Fehler, Fristrisiko) und `
 `reports/` – der Bericht wird über den `tim`-Agenten als proaktive Präsentation an den
 Nutzer zugestellt (der Default-Sender schreibt auf stderr/Konsole).
 
+**Verifizierte Konfiguration (Stand 16.09.2026):** Ein Smoke-Test über das MCP-Protokoll
+(`tools/list` + `tools/call` mit `action:"status"`) bestätigt: `teams_schedule_activity_report`
+ist registriert und der Scheduler läuft mit `running: true`, `tenant: "adesso"`,
+`times: ["09:00","17:00"]`, `maxItems: 50`, `topN: 3`, Reports nach
+`reports/`. Beim Serverstart wird der Scheduler automatisch gestartet
+(EnV `TEAMS_MCP_ACTIVITY_SCHEDULER=0` deaktiviert, `TEAMS_MCP_ACTIVITY_TIMES` überschreibt
+die Zeiten).
+
 ## Projektstruktur
 
 ```
