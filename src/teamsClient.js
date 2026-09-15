@@ -225,7 +225,8 @@ export class TeamsClient {
     const activeChat = await this.getActiveChatTitle(page);
     await page.waitForSelector('[data-tid="chat-pane-message"], .fui-ChatMessage__body, .fui-ChatMyMessage__body', { timeout: 15000 }).catch(() => null);
 
-    const messagesData = await page.evaluate(({ max, selfName }) => {
+    const messagesData = await page.evaluate(({ max, selfName, helperStr }) => {
+      const toIso = new Function('return (' + helperStr + ')')();
       const msgs = [];
       const msgBodies = Array.from(document.querySelectorAll('[data-tid="chat-pane-message"], .fui-ChatMessage__body, .fui-ChatMyMessage__body'));
       const slice = msgBodies.slice(-max);
@@ -254,17 +255,56 @@ export class TeamsClient {
 
         const html = body.innerHTML || '';
         const text = body.innerText?.trim() || '';
+        if (!text && !html) continue;
 
-        if (text) {
-          msgs.push({
-            author: author || 'Unbekannt',
-            html: html,
-            text: text
-          });
+        // Timestamp-Extraktion mit mehreren Strategien (robust gegen Teams/UI-Variationen).
+        const mid = body.getAttribute('data-mid') || '';
+        let timestamp = null;
+        let timestampRaw = null;
+
+        // Strategie 1: data-mid ist bei Teams-Web oft ein Unix-Millis-Timestamp.
+        if (mid) {
+          const isoFromMid = toIso(mid);
+          if (isoFromMid) {
+            timestamp = isoFromMid;
+            timestampRaw = mid;
+          }
         }
+
+        // Strategie 2: dediziertes Timestamp-Element (aria-labelledby referenziert "timestamp-{mid}").
+        if (!timestamp && mid) {
+          const tsEl = document.getElementById(`timestamp-${mid}`);
+          if (tsEl) {
+            const dT = tsEl.getAttribute('datetime') || tsEl.getAttribute('title') || '';
+            if (dT) {
+              const iso = toIso(dT);
+              if (iso) { timestamp = iso; timestampRaw = dT || (tsEl.innerText || tsEl.textContent || '').trim(); }
+            } else {
+              timestampRaw = (tsEl.innerText || tsEl.textContent || '').trim();
+            }
+          }
+        }
+
+        // Strategie 3: internes <time datetime> im Body.
+        if (!timestamp) {
+          const timeEl = body.querySelector('time[datetime]');
+          if (timeEl) {
+            const iso = toIso(timeEl.getAttribute('datetime'));
+            if (iso) { timestamp = iso; timestampRaw = timeEl.getAttribute('datetime'); }
+          }
+        }
+
+        msgs.push({
+          author: author || 'Unbekannt',
+          html: html,
+          text: text,
+          mid: mid || undefined,
+          timestamp: timestamp || undefined,
+          timestampRaw: timestampRaw || undefined
+        });
       }
       return msgs;
-    }, { max: limit, selfName: config.selfName });
+    }, { max: limit, selfName: config.selfName, helperStr: messageTimeToIso.toString() });
 
     return {
       tenant: t,
@@ -272,7 +312,10 @@ export class TeamsClient {
       count: messagesData.length,
       messages: messagesData.map(m => ({
         author: m.author,
-        content: turndown.turndown(m.html || m.text)
+        content: turndown.turndown(m.html || m.text),
+        mid: m.mid,
+        timestamp: m.timestamp,
+        timestampRaw: m.timestampRaw
       }))
     };
   }
@@ -440,107 +483,246 @@ export class TeamsClient {
       }
     }
 
-    // 2. Kaskade: Büroklammer / Attach-Button im Compose-Footer
+    // 2. Kaskade: Büroklammer / Attach-Button / Aktionen-Button im Compose-Footer
     const attachButtonSelectors = [
+      // Spezifische Teams Test-IDs
       'button[data-tid="newMessageCommands-FilePicker"]',
-      'button[data-tid*="FilePicker"]',
-      'button[aria-label*="Attach files" i]',
-      'button[aria-label*="Dateien anhängen" i]',
-      'button[aria-label*="Dateien anheften" i]',
+      'button[data-tid*="FilePicker" i]',
+      'button[data-tid*="file-picker" i]',
+      'button[data-tid*="file-upload" i]',
+      'button[data-tid*="attachment" i]',
+      'button[data-tid="compose-attach-button"]',
+      'button[data-tid="attach-button"]',
+      'button[data-tid*="attach" i]',
       '[data-tid="chat-pane-compose-message-footer"] button[data-tid="attach-button"]',
       '[data-tid="chat-pane-compose-message-footer"] button[data-tid="compose-attach-button"]',
-      '[data-tid="chat-pane-compose"] button[aria-label*="anhängen" i]',
-      '[data-tid="chat-pane-compose"] button[aria-label*="attach" i]',
-      '[data-tid="chat-pane-compose"] button[title*="anhängen" i]',
-      '[data-tid="chat-pane-compose"] button[title*="attach" i]',
-      'button[data-tid="attach-button"]',
-      'button[data-tid="compose-attach-button"]',
+      '[data-tid="chat-pane-compose"] button[data-tid*="attach" i]',
+
+      // Deutsche Labels (Teams Web DE)
+      'button[aria-label*="anfügen" i]',
+      'button[aria-label*="anhängen" i]',
+      'button[aria-label*="anheften" i]',
+      'button[aria-label*="Dateien" i]',
+      'button[aria-label*="Datei" i]',
+      'button[title*="anfügen" i]',
+      'button[title*="anhängen" i]',
+      'button[title*="anheften" i]',
+      'button[title*="Datei" i]',
+
+      // Englische Labels (Teams Web EN)
+      'button[aria-label*="Attach" i]',
+      'button[aria-label*="File" i]',
+      'button[aria-label*="Upload" i]',
+      'button[title*="Attach" i]',
+      'button[title*="File" i]',
+
+      // Icons (Paperclip / Büroklammer / Attach)
+      'button:has(svg[data-icon-name*="Attach" i])',
+      'button:has(svg[data-icon-name*="Paperclip" i])',
+      'button:has(i[data-icon-name*="Attach" i])',
+      'button:has(i[data-icon-name*="Paperclip" i])',
+
+      // Modern Teams v2: "Aktionen und Apps" / "+" Button im Compose-Footer
+      'button[aria-label*="Aktionen und Apps" i]',
+      'button[aria-label*="Aktionen" i]',
+      'button[aria-label*="Actions and apps" i]',
+      'button[aria-label*="Add an action" i]',
+      'button[aria-label*="Weitere Aktionen" i]',
+      'button[data-tid*="action-overflow" i]',
+      'button[data-tid*="actions-and-apps" i]',
+      'button[data-tid="plus-button"]',
       'button[data-tid="expand-compose-actions-button"]'
     ];
 
     let attachBtn = null;
     for (const sel of attachButtonSelectors) {
-      attachBtn = await page.$(sel);
-      if (attachBtn) break;
+      try {
+        const btn = await page.$(sel);
+        if (btn && await btn.isVisible().catch(() => true)) {
+          attachBtn = btn;
+          break;
+        }
+      } catch (e) {}
     }
 
+    // Falls Selektoren keinen Treffer brachten: DOM-Scan über Toolbar-/Footer-Buttons
     if (!attachBtn) {
-      throw new Error("Dateianhang fehlgeschlagen: Kein Datei-Upload-Button oder Datei-Input im Compose-Bereich gefunden.");
+      const handle = await page.evaluateHandle(() => {
+        const containers = Array.from(document.querySelectorAll('[role="toolbar"], [data-tid*="compose"], footer, [data-tid*="chat-pane"]'));
+        for (const c of containers) {
+          const btns = Array.from(c.querySelectorAll('button'));
+          for (const b of btns) {
+            const txt = (b.innerText || '').toLowerCase();
+            const label = (b.getAttribute('aria-label') || '').toLowerCase();
+            const title = (b.getAttribute('title') || '').toLowerCase();
+            const tid = (b.getAttribute('data-tid') || '').toLowerCase();
+            const props = `${txt} ${label} ${title} ${tid}`;
+            if (
+              props.includes('anfüg') ||
+              props.includes('anhäng') ||
+              props.includes('anheft') ||
+              props.includes('attach') ||
+              props.includes('datei') ||
+              props.includes('file') ||
+              props.includes('aktion') ||
+              props.includes('action') ||
+              props.includes('paperclip')
+            ) {
+              return b;
+            }
+          }
+        }
+        return null;
+      });
+      attachBtn = handle.asElement();
     }
 
-    // Prüfen, ob Klick direkt den FileChooser öffnet
-    const chooserPromise = page.waitForEvent('filechooser', { timeout: 2500 }).catch(() => null);
-    await attachBtn.click();
-    const fileChooser = await chooserPromise;
+    let fileChooser = null;
+    if (attachBtn) {
+      // Prüfen, ob Klick direkt den FileChooser öffnet
+      const chooserPromise = page.waitForEvent('filechooser', { timeout: 2500 }).catch(() => null);
+      await attachBtn.click().catch(() => null);
+      fileChooser = await chooserPromise;
 
-    if (fileChooser) {
-      await fileChooser.setFiles(filePaths);
-    } else {
-      // Möglicherweise hat sich ein Dropdown/Flyout-Menü geöffnet ("Von diesem Gerät hochladen")
-      await page.waitForTimeout(600);
-      const menuSelectors = [
-        '[data-tid="upload-from-computer"]',
-        '[data-tid="attach-upload-from-computer"]',
-        '[role="menuitem"]:has-text("diesem Gerät")',
-        '[role="menuitem"]:has-text("this device")',
-        '[role="menuitem"]:has-text("Computer")',
-        '[role="menuitem"]:has-text("computer")',
-        '[role="menuitem"]:has-text("Gerät")',
-        '[role="menuitem"]:has-text("Upload")',
-        'button:has-text("diesem Gerät")',
-        'button:has-text("this device")',
-        'button:has-text("Upload")'
-      ];
+      if (!fileChooser) {
+        // Möglicherweise hat sich ein Dropdown/Flyout-Menü geöffnet ("Von diesem Gerät hochladen")
+        await page.waitForTimeout(600);
+        const menuSelectors = [
+          '[data-tid="upload-from-computer"]',
+          '[data-tid*="upload-from-computer" i]',
+          '[data-tid*="attach-upload-from-computer" i]',
+          '[data-tid*="upload" i]',
+          '[data-tid*="device" i]',
+          '[role="menuitem"]:has-text("diesem Gerät")',
+          '[role="menuitem"]:has-text("diesem Computer")',
+          '[role="menuitem"]:has-text("Computer")',
+          '[role="menuitem"]:has-text("this device")',
+          '[role="menuitem"]:has-text("computer")',
+          '[role="menuitem"]:has-text("Gerät")',
+          '[role="menuitem"]:has-text("Upload")',
+          '[role="menuitem"]:has-text("Dateien anfügen")',
+          '[role="menuitem"]:has-text("Datei anfügen")',
+          '[role="menuitem"]:has-text("Dateien hochladen")',
+          '[role="menuitem"]:has-text("Datei hochladen")',
+          'button:has-text("diesem Gerät")',
+          'button:has-text("this device")',
+          'button:has-text("Computer")',
+          'button:has-text("Upload")'
+        ];
 
-      let menuOption = null;
-      for (const sel of menuSelectors) {
-        menuOption = await page.$(sel);
-        if (menuOption) break;
-      }
+        let menuOption = null;
+        for (const sel of menuSelectors) {
+          try {
+            menuOption = await page.$(sel);
+            if (menuOption && await menuOption.isVisible().catch(() => true)) break;
+          } catch (e) {}
+        }
 
-      // Falls menuOption noch nicht gefunden: alle Menüeinträge per Text durchsuchen
-      if (!menuOption) {
-        const handle = await page.evaluateHandle(() => {
-          const items = Array.from(document.querySelectorAll('[role="menu"] [role="menuitem"], [role="menu"] button, div[role="menuitem"], div[class*="menu"] [role="menuitem"]'));
-          return items.find(el => {
-            const txt = (el.innerText || el.textContent || '').toLowerCase();
-            return txt.includes('gerät') || txt.includes('device') || txt.includes('computer') || txt.includes('upload');
-          }) || null;
-        });
-        menuOption = handle.asElement();
-      }
+        // Falls menuOption noch nicht gefunden: alle Menüeinträge per Text durchsuchen
+        if (!menuOption) {
+          const handle = await page.evaluateHandle(() => {
+            const items = Array.from(document.querySelectorAll(
+              '[role="menu"] [role="menuitem"], [role="menu"] button, [role="listbox"] [role="option"], div[role="menuitem"], div[class*="menu"] [role="menuitem"], div[class*="popover"] button, div[class*="flyout"] button'
+            ));
+            return items.find(el => {
+              const txt = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').toLowerCase();
+              return txt.includes('gerät') || txt.includes('device') || txt.includes('computer') || txt.includes('upload') || txt.includes('hochladen') || txt.includes('datei');
+            }) || null;
+          });
+          menuOption = handle.asElement();
+        }
 
-      if (menuOption) {
-        const [uploadChooser] = await Promise.all([
-          page.waitForEvent('filechooser', { timeout: 8000 }),
-          menuOption.click()
-        ]);
-        await uploadChooser.setFiles(filePaths);
-      } else {
-        // Eventuell wurde das input[type="file"] erst durch den Klick ins DOM gehängt
-        const lateInput = await page.$('input[type="file"]');
-        if (lateInput) {
-          await lateInput.setInputFiles(filePaths);
-        } else {
-          throw new Error("Dateianhang fehlgeschlagen: 'Von diesem Gerät hochladen'-Option im Menü nicht gefunden.");
+        if (menuOption) {
+          const [uploadChooser] = await Promise.all([
+            page.waitForEvent('filechooser', { timeout: 8000 }).catch(() => null),
+            menuOption.click().catch(() => null)
+          ]);
+          fileChooser = uploadChooser;
         }
       }
     }
 
-    await this.waitForAttachmentUpload(page, filePaths);
+    if (fileChooser) {
+      await fileChooser.setFiles(filePaths);
+      await this.waitForAttachmentUpload(page, filePaths);
+      return;
+    }
+
+    // 3. Kaskade: Eventuell wurde das input[type="file"] erst durch Interaktion ins DOM gehängt
+    const lateInputs = await page.$$('input[type="file"]');
+    if (lateInputs.length > 0) {
+      for (const lateInput of lateInputs) {
+        try {
+          await lateInput.setInputFiles(filePaths);
+          await this.waitForAttachmentUpload(page, filePaths);
+          return;
+        } catch (e) {}
+      }
+    }
+
+    // 4. Kaskade: Drag & Drop Fallback via HTML5 DataTransfer auf das Compose-Feld
+    try {
+      const filesData = filePaths.map(fp => ({
+        name: path.basename(fp),
+        type: 'application/octet-stream',
+        content: fs.readFileSync(fp).toString('base64')
+      }));
+
+      const dropSuccess = await page.evaluate(({ selector, files }) => {
+        const target = document.querySelector(selector) || document.querySelector('div[role="textbox"]');
+        if (!target) return false;
+
+        const dt = new DataTransfer();
+        for (const file of files) {
+          const byteCharacters = atob(file.content);
+          const byteNumbers = new Array(byteCharacters.length);
+          for (let i = 0; i < byteCharacters.length; i++) {
+            byteNumbers[i] = byteCharacters.charCodeAt(i);
+          }
+          const byteArray = new Uint8Array(byteNumbers);
+          const blob = new Blob([byteArray], { type: file.type });
+          const domFile = new File([blob], file.name, { type: file.type });
+          dt.items.add(domFile);
+        }
+
+        target.dispatchEvent(new DragEvent('dragenter', { dataTransfer: dt, bubbles: true, cancelable: true }));
+        target.dispatchEvent(new DragEvent('dragover', { dataTransfer: dt, bubbles: true, cancelable: true }));
+        target.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+        return true;
+      }, { selector: '[data-tid="ckeditor"], div[role="textbox"], [contenteditable]', files: filesData });
+
+      if (dropSuccess) {
+        await this.waitForAttachmentUpload(page, filePaths);
+        return;
+      }
+    } catch (dropErr) {
+      // Ignorieren und unten verständlichen Fehler werfen
+    }
+
+    throw new Error("Dateianhang fehlgeschlagen: Kein Datei-Upload-Button, Datei-Input oder Drop-Ziel im Compose-Bereich ansprechbar.");
   }
 
   // Wartet auf das Fertigstellen des Uploads in Teams
   async waitForAttachmentUpload(page, filePaths = []) {
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(1500);
 
     // Auf Verschwinden von Progressbars warten
     try {
-      const progressbars = page.locator('[data-tid="chat-pane-compose"] [role="progressbar"], div[role="progressbar"]');
+      const progressbars = page.locator('[data-tid*="compose"] [role="progressbar"], div[role="progressbar"], [data-tid*="progress"]');
       const count = await progressbars.count();
       if (count > 0) {
         await progressbars.first().waitFor({ state: 'detached', timeout: 60000 });
       }
+    } catch (e) {}
+
+    // Warten, bis Dateikarte(n) oder Anhang-Vorschau im Compose-Bereich sichtbar sind
+    try {
+      await page.waitForFunction(() => {
+        const compose = document.querySelector('[data-tid*="compose"], footer');
+        if (!compose) return true;
+        const cards = compose.querySelectorAll('[data-tid*="attachment"], [data-tid*="file-card"], [class*="attachment"], [class*="fileCard"]');
+        return cards.length > 0;
+      }, { timeout: 8000 }).catch(() => null);
     } catch (e) {}
 
     // Sicherstellen, dass der Senden-Button aktiv / nicht disabled ist
@@ -553,7 +735,8 @@ export class TeamsClient {
   }
 
   async inspectCompose(tenant = '') {
-    const t = browserManager.normalizeTenant(tenant);
+    const raw = (!tenant || tenant === 'all') ? config.defaultTenant : tenant;
+    const t = browserManager.normalizeTenant(raw);
     const page = await this.getPage(t, true);
 
     const activeChat = await this.getActiveChatTitle(page);
@@ -568,19 +751,25 @@ export class TeamsClient {
         visible: i.offsetWidth > 0 && i.offsetHeight > 0
       }));
 
-      const composeFooter = document.querySelector('[data-tid="chat-pane-compose-message-footer"], [data-tid="chat-pane-compose"]');
-      const composeButtons = composeFooter ? Array.from(composeFooter.querySelectorAll('button')).map(b => ({
-        dataTid: b.getAttribute('data-tid') || null,
-        ariaLabel: b.getAttribute('aria-label') || null,
-        title: b.getAttribute('title') || null,
-        innerText: b.innerText?.trim() || '',
-        disabled: b.disabled || b.getAttribute('aria-disabled') === 'true'
-      })) : [];
+      const composeFooter = document.querySelector('[data-tid="chat-pane-compose-message-footer"], [data-tid="chat-pane-compose"], footer, [role="region"][aria-label*="compose" i]');
+      const toolbars = Array.from(document.querySelectorAll('[role="toolbar"], footer, [data-tid*="compose"]'));
+      const allButtons = [];
+      for (const tb of toolbars) {
+        for (const b of tb.querySelectorAll('button')) {
+          allButtons.push({
+            dataTid: b.getAttribute('data-tid') || null,
+            ariaLabel: b.getAttribute('aria-label') || null,
+            title: b.getAttribute('title') || null,
+            innerText: b.innerText?.trim() || '',
+            disabled: b.disabled || b.getAttribute('aria-disabled') === 'true'
+          });
+        }
+      }
 
       return {
         hasComposeFooter: !!composeFooter,
         fileInputs,
-        composeButtons
+        composeButtons: allButtons.slice(0, 30)
       };
     });
 
@@ -746,6 +935,30 @@ export class TeamsClient {
     const t = browserManager.normalizeTenant(tenant);
     return await speakerTracker.stopTracking(t);
   }
+}
+
+// PURE Hilfsfunktion: konvertiert einen Teams-Zeitwert (data-mid als Unix-Millis/-Sekunden,
+// <time datetime> ISO) zu einem ISO-8601-String. Muss reine Funktion bleiben (ohne Zugriff auf
+// Modul-Scope), damit sie via .toString() für page.evaluate serialisierbar ist.
+export function messageTimeToIso(raw) {
+  if (raw == null || raw === '') return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  // Unix-Epoche: 13-stellig = Millis, 10-stellig = Sekunden
+  if (/^\d{10,13}$/.test(s)) {
+    const num = Number(s);
+    const ms = s.length >= 13 ? num : num * 1000;
+    const d = new Date(ms);
+    if (!isNaN(d.getTime()) && d.getFullYear() > 2000 && d.getFullYear() < 2100) {
+      return d.toISOString();
+    }
+  }
+  // <time datetime="..."> ISO
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) {
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) return d.toISOString();
+  }
+  return null;
 }
 
 export const teamsClient = new TeamsClient();

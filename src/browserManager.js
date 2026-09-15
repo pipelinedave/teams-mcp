@@ -10,8 +10,9 @@ class BrowserManager {
   }
 
   normalizeTenant(tenant) {
-    if (!tenant) return '';
-    const t = String(tenant).toLowerCase().trim();
+    const raw = (!tenant || tenant === 'all') ? config.defaultTenant : tenant;
+    if (!raw) return config.defaultTenant || 'adesso';
+    const t = String(raw).toLowerCase().trim();
     const realms = config.tenantRealms;
     if (realms[t]) return t; // exakter konfigurierter Key
     const keys = Object.keys(realms);

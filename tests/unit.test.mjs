@@ -1,8 +1,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { TeamsClient } from '../src/teamsClient.js';
+import { TeamsClient, messageTimeToIso } from '../src/teamsClient.js';
 import { browserManager } from '../src/browserManager.js';
-import { cleanSpeakerName, aggregateEvents } from '../src/speakerTracker.js';
+import { cleanSpeakerName, aggregateEvents, isBotOrUiName } from '../src/speakerTracker.js';
 
 // Instanz des TeamsClient (nur zur Nutzung der puren pickChatRow-Methode)
 const client = new TeamsClient();
@@ -82,6 +82,13 @@ describe('normalizeTenant / realm - Org-neutrale Tenant-Logik', () => {
   test('realm: Realm-artiger Wert direkt', () => {
     assert.equal(browserManager.realm('meine-org.onmicrosoft.com'), 'meine-org.onmicrosoft.com');
   });
+
+  test('Smart-Default: leerer Tenant, undefined oder "all" fällt auf Default ("adesso") zurück', () => {
+    assert.equal(browserManager.normalizeTenant(''), 'adesso');
+    assert.equal(browserManager.normalizeTenant(undefined), 'adesso');
+    assert.equal(browserManager.normalizeTenant(null), 'adesso');
+    assert.equal(browserManager.normalizeTenant('all'), 'adesso');
+  });
 });
 
 
@@ -92,6 +99,22 @@ describe('speakerTracker - Name cleaning & Event aggregation', () => {
     assert.equal(cleanSpeakerName('Pierre (Extern)'), 'Pierre');
     assert.equal(cleanSpeakerName('David Hallmann'), 'David Hallmann');
     assert.equal(cleanSpeakerName(''), '');
+  });
+
+  test('isBotOrUiName erkennt Teams-Copilot und UI-Platzhalter', () => {
+    assert.equal(isBotOrUiName('Copilot'), true);
+    assert.equal(isBotOrUiName('Microsoft Copilot'), true);
+    assert.equal(isBotOrUiName('Copilot Notebook'), true);
+    assert.equal(isBotOrUiName(''), true);
+    assert.equal(isBotOrUiName(null), true);
+    assert.equal(isBotOrUiName('Recording in progress'), true);
+    assert.equal(isBotOrUiName('Chat'), true);
+  });
+
+  test('isBotOrUiName lässt echte Personen durch', () => {
+    assert.equal(isBotOrUiName('Theys Schiller'), false);
+    assert.equal(isBotOrUiName('Yannick Bülter'), false);
+    assert.equal(isBotOrUiName('David Hallmann'), false);
   });
 
   test('aggregateEvents: leere Samples liefern leeres Array', () => {
@@ -166,6 +189,40 @@ describe('speakerTracker - Name cleaning & Event aggregation', () => {
     assert.equal(intervals.length, 2);
     assert.equal(intervals[0].speaker, 'Yannick');
     assert.equal(intervals[1].speaker, 'Mathis');
+  });
+});
+
+describe('messageTimeToIso - Teams-Zeitstempel-Normalisierung', () => {
+  test('data-mid als Unix-Millis (13-stellig) -> ISO', () => {
+    // 1789463782694 ms ~ 2026-09-15
+    const iso = messageTimeToIso('1789463782694');
+    assert.ok(iso.startsWith('2026-09-15T'));
+    assert.ok(iso.endsWith('Z'));
+  });
+
+  test('Unix-Sekunden (10-stellig) -> ISO', () => {
+    const iso = messageTimeToIso('1789463782');
+    assert.ok(iso.startsWith('2026-09-15T'));
+  });
+
+  test('<time datetime> ISO-String bleibt erhalten', () => {
+    const iso = messageTimeToIso('2026-09-15T11:16:27.330Z');
+    assert.equal(iso, new Date('2026-09-15T11:16:27.330Z').toISOString());
+  });
+
+  test('leere / null / undefined -> null', () => {
+    assert.equal(messageTimeToIso(''), null);
+    assert.equal(messageTimeToIso(null), null);
+    assert.equal(messageTimeToIso(undefined), null);
+  });
+
+  test('Nicht-Zeitstempel (z.B. GUID) -> null', () => {
+    assert.equal(messageTimeToIso('1:19c8f2a0-9b3d-4c5e-a1f2-8b7c6d5e4f3a'), null);
+    assert.equal(messageTimeToIso('kein timestamp'), null);
+  });
+
+  test('Millis außerhalb plausibler Reichweite -> null', () => {
+    assert.equal(messageTimeToIso('999999'), null);
   });
 });
 

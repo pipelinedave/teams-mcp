@@ -70,6 +70,18 @@ function getTenants() {
   return Object.keys(getTenantRealms());
 }
 
+// Standard-Tenant Fallback (per Env TEAMS_MCP_DEFAULT_TENANT überschreibbar, sonst erster konfigurierter Tenant, sonst "adesso").
+function getDefaultTenant() {
+  if (process.env.TEAMS_MCP_DEFAULT_TENANT) {
+    return process.env.TEAMS_MCP_DEFAULT_TENANT.trim();
+  }
+  const tenants = getTenants();
+  if (tenants.length > 0) {
+    return tenants[0];
+  }
+  return 'adesso';
+}
+
 // Eigener Anzeigename für "Ich"-Nachrichten (Fallback im Message-Pane).
 function getSelfName() {
   return process.env.TEAMS_MCP_SELF_NAME || 'Ich';
@@ -94,6 +106,7 @@ export const config = {
   profileBase: getProfileBase(),
   tenantRealms: getTenantRealms(),
   tenants: getTenants(),
+  defaultTenant: getDefaultTenant(),
   selfName: getSelfName(),
   defaultHeadless: getDefaultHeadless()
 };

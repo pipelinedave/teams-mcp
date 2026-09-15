@@ -13,6 +13,35 @@ export function cleanSpeakerName(rawName) {
 }
 
 /**
+ * Set of known non-human Teams entries that must never be treated as a meeting
+ * participant or 1:1 call partner (Teams Copilot/Notebook, transcription bots,
+ * busy-status placeholders, UI labels).
+ */
+const BOT_NAME_PATTERNS = [
+  /\bcopilot\b/i,
+  /\bnotebook\b/i,
+  /\brecording(?: is)? in progress\b/i,
+  /\btranscription(?: has)? started\b/i,
+  /\blive caption(s)?\b/i,
+  /\bmeet(?:ing)? chat\b/i,
+  /\bchat\b/i,
+  /\baways?\b/i,
+  /\bappear(?:ance)?\b/i,
+  /\bstaus\b/i,
+];
+
+/**
+ * True if the name refers to a Team UI pseudo-entry / bot (e.g. "Copilot")
+ * rather than a real human participant or 1:1 call partner.
+ */
+export function isBotOrUiName(name) {
+  const n = (name || '').trim();
+  if (!n) return true;
+  const lower = n.toLowerCase();
+  return BOT_NAME_PATTERNS.some((re) => re.test(lower)) || lower.includes('copilot');
+}
+
+/**
  * Aggregates raw discrete timestamp samples or state transitions into clean, continuous intervals.
  * Merges short speech pauses (< minGapMs) and ignores momentary noise spikes (< minDurationMs).
  */
@@ -373,6 +402,15 @@ export class SpeakerTracker {
 
       if (topChatInfo && topChatInfo.title) {
         const cleanName = cleanSpeakerName(topChatInfo.title);
+        // Bots/UI-Pseudo-Einträge (z.B. "Copilot") sind NIE ein echter 1:1-Gesprächspartner.
+        // Statt einen erfundenen Partner zu liefern, melden wir lieber "unbekannt",
+        // damit downstream keine Falsch-Zuordnung der Gegenseite entsteht.
+        if (isBotOrUiName(cleanName)) {
+          console.warn(
+            `[SpeakerTracker] Oberster Chat '${cleanName}' ist ein Bot/UI-Eintrag – keine 1:1-Zuordnung.`
+          );
+          return { joined: false, meetingTitle: '1:1 Call (unbekannter Partner)', knownSpeakers: [] };
+        }
         console.log(`[SpeakerTracker] Detected active/recent chat partner: '${cleanName}'`);
         return { joined: false, meetingTitle: `1:1 Call ${cleanName}`, knownSpeakers: [cleanName] };
       }
@@ -545,7 +583,10 @@ export class SpeakerTracker {
     const uniqueSpeakers = Array.from(new Set(intervals.map(i => i.speaker)));
     let finalSpeakers = uniqueSpeakers;
     if (finalSpeakers.length === 0 && session.knownSpeakers && session.knownSpeakers.length > 0) {
-      finalSpeakers = session.knownSpeakers;
+      // Nur echte (nicht-Bot) bekannte Partner als Fallback übernehmen, wenn keine
+      // DOM-Intervalle erkannt wurden. Bot/UI-Namen (z.B. "Copilot") würden sonst
+      // die gesamte Gegenseite fälschlich auf einen Pseudo-Namen mappen.
+      finalSpeakers = session.knownSpeakers.filter((s) => !isBotOrUiName(s));
     }
 
     const result = {

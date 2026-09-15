@@ -26,18 +26,29 @@ const server = new Server(
 // konfigurierte Tenants vorhanden, werden sie als validierte Enum angeboten; sonst ist
 // es ein freies Textfeld (möglichst mit Realm, z.B. "meine-org.onmicrosoft.com").
 const knownTenants = config.tenants;
+const defaultTenant = config.defaultTenant || 'adesso';
 
 const tenantParam = (options = {}) => {
   const base = {
     type: 'string',
     description: options.includeAll
-      ? [knownTenants.length ? `Bekannte Tenants: ${knownTenants.join(', ')}. ` : '', 'Wert oder "all" (Standard: "all").'].join('')
-      : [knownTenants.length ? `Bekannte Tenants: ${knownTenants.join(', ')}. ` : '', 'Tenant (Name oder Realm, z.B. "meine-org.onmicrosoft.com").'].join('')
+      ? [knownTenants.length ? `Bekannte Tenants: ${knownTenants.join(', ')}. ` : '', `Wert oder "all" (Standard: "${options.def || (knownTenants.length ? 'all' : defaultTenant)}").`].join('')
+      : [knownTenants.length ? `Bekannte Tenants: ${knownTenants.join(', ')}. ` : '', `Tenant (Name oder Realm, z.B. "meine-org.onmicrosoft.com", Standard: "${defaultTenant}").`].join('')
   };
   if (knownTenants.length) base.enum = [...knownTenants, ...(options.includeAll ? ['all'] : [])];
   if (options.def !== undefined) base.default = options.def;
+  else base.default = defaultTenant;
   return base;
 };
+
+// Hilfsfunktion: Löst einen Tenant-Parameter smart auf.
+// Kein Tenant oder "all" (bei Einzeltenant-Operationen) fällt sauber auf den Standard-Tenant zurück ("adesso").
+function resolveTenant(tenant) {
+  if (!tenant || tenant === 'all') {
+    return defaultTenant;
+  }
+  return browserManager.normalizeTenant(tenant);
+}
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
@@ -223,13 +234,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case 'teams_status': {
-        const tenantArg = args?.tenant || 'all';
-        if (tenantArg === 'all') {
-          if (knownTenants.length === 0) {
-            throw new Error("Für 'all' muss mindestens ein Tenant konfiguriert sein (TEAMS_MCP_TENANTS / TEAMS_MCP_TENANT_REALMS). Bitte stattdessen einen konkreten Tenant angeben.");
-          }
+        const tenantArg = args?.tenant;
+        if (!tenantArg || tenantArg === 'all') {
+          // Falls Tenants konfiguriert sind, alle prüfen.
+          // Falls keine Env-Konfiguration vorliegt, Smart-Default auf den Standard-Tenant ("adesso").
+          const targets = knownTenants.length > 0 ? knownTenants : [defaultTenant];
           const statuses = {};
-          for (const t of knownTenants) {
+          for (const t of targets) {
             statuses[t] = await teamsClient.checkStatus(t);
           }
           return {
@@ -241,7 +252,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             ]
           };
         } else {
-          const status = await teamsClient.checkStatus(tenantArg);
+          const status = await teamsClient.checkStatus(resolveTenant(tenantArg));
           return {
             content: [{ type: 'text', text: JSON.stringify(status, null, 2) }]
           };
@@ -249,7 +260,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'teams_login': {
-        const tenant = args?.tenant;
+        const tenant = resolveTenant(args?.tenant);
         await browserManager.openLoginWindow(tenant);
         const realm = browserManager.realm(tenant);
         return {
@@ -263,7 +274,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'teams_list_chats': {
-        const tenant = args?.tenant;
+        const tenant = resolveTenant(args?.tenant);
         const limit = args?.limit || 15;
         const result = await teamsClient.listChats(tenant, limit);
         return {
@@ -272,7 +283,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'teams_get_messages': {
-        const tenant = args?.tenant;
+        const tenant = resolveTenant(args?.tenant);
         const result = await teamsClient.getMessages(tenant, {
           chatIndex: args?.chat_index,
           chatName: args?.chat_name,
@@ -284,7 +295,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'teams_search': {
-        const tenant = args?.tenant;
+        const tenant = resolveTenant(args?.tenant);
         const limit = args?.limit || 10;
         const result = await teamsClient.search(tenant, args.query, limit);
         return {
@@ -293,7 +304,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'teams_list_teams': {
-        const tenant = args?.tenant;
+        const tenant = resolveTenant(args?.tenant);
         const result = await teamsClient.listTeams(tenant);
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
@@ -301,7 +312,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'teams_send_message': {
-        const tenant = args?.tenant;
+        const tenant = resolveTenant(args?.tenant);
         const rawAttachments = args?.attachments || (args?.attachment ? [args.attachment] : []);
         const result = await teamsClient.sendMessage(tenant, {
           message: args.message,
@@ -314,15 +325,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'teams_inspect': {
-        const tenant = args?.tenant;
+        const tenant = resolveTenant(args?.tenant);
         const result = await teamsClient.inspectCompose(tenant);
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
         };
       }
 
-case 'teams_meeting_status': {
-        const tenant = args?.tenant;
+      case 'teams_meeting_status': {
+        const tenant = resolveTenant(args?.tenant);
         const result = await teamsClient.getMeetingStatus(tenant);
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
@@ -330,7 +341,7 @@ case 'teams_meeting_status': {
       }
 
       case 'teams_start_tracking': {
-        const tenant = args?.tenant;
+        const tenant = resolveTenant(args?.tenant);
         const result = await teamsClient.startSpeakerTracking(tenant, args?.output_path);
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
@@ -338,7 +349,7 @@ case 'teams_meeting_status': {
       }
 
       case 'teams_stop_tracking': {
-        const tenant = args?.tenant;
+        const tenant = resolveTenant(args?.tenant);
         const result = await teamsClient.stopSpeakerTracking(tenant);
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
