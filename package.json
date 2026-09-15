@@ -16,7 +16,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js && node --check src/config.js && node --check src/browserManager.js && node --check src/teamsClient.js",
+    "check": "node --check index.js && node --check src/config.js && node --check src/browserManager.js && node --check src/teamsClient.js && node --check src/activityClient.js && node --check src/activityAnalyzer.js && node --check src/activityReportScheduler.js && node --check src/speakerTracker.js",
     "test": "node --test tests/unit.test.mjs",
     "test:integration": "node tests/integration.test.mjs"
   },

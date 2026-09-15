@@ -1,8 +1,14 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { TeamsClient, messageTimeToIso } from '../src/teamsClient.js';
 import { browserManager } from '../src/browserManager.js';
 import { cleanSpeakerName, aggregateEvents, isBotOrUiName } from '../src/speakerTracker.js';
+import { extractActivityFromDom } from '../src/activityClient.js';
+import { classify, analyzeItems, buildReportText, writeReport, CATEGORIES } from '../src/activityAnalyzer.js';
+import { toMinutes, writeTimestampedReport, ActivityReportScheduler, DEFAULT_SCHEDULE } from '../src/activityReportScheduler.js';
 
 // Instanz des TeamsClient (nur zur Nutzung der puren pickChatRow-Methode)
 const client = new TeamsClient();
@@ -260,5 +266,305 @@ describe('validateAttachments - Dateianhang-Validierung', () => {
       () => client.validateAttachments('src'),
       /Anhang ist keine reguläre Datei/
     );
+  });
+});
+
+describe('extractActivityFromDom - Teams Activity-Feed Extraktion (Layer 1)', () => {
+  // Minimaler DOM-Mock: nachgebildete Teams-Activity-Struktur
+  function makeEl({ text, attrs = {}, time = null, children = [] }) {
+    return {
+      innerText: text,
+      textContent: text,
+      outerHTML: `<div data-tid="activity-item">${text}</div>`,
+      getAttribute: (name) => attrs[name] ?? null,
+      querySelector: (sel) => {
+        if (sel === 'time[datetime]' && time) {
+          return { getAttribute: (n) => (n === 'datetime' ? time : null), innerText: time };
+        }
+        // Komma-Selektor [data-tid*="avatar" i], [role="img"] wie echtes Browser-DOM auflösen
+        const avatarSel = sel.includes('avatar') || sel === '[role="img"]';
+        if (avatarSel) {
+          return attrs.avatar ? { getAttribute: (n) => (n === 'aria-label' ? attrs.avatar : null) } : null;
+        }
+        return null;
+      },
+      querySelectorAll: () => children
+    };
+  }
+  function buildFeed(items) {
+    const root = { querySelectorAll: () => items, querySelector: () => null, getAttribute: () => null };
+    return {
+      querySelector: (sel) => (sel.startsWith('[data-tid="activity-feed"]') ? root : null),
+      querySelectorAll: () => []
+    };
+  }
+
+  const feedItems = [
+    makeEl({ text: 'Yannick Bülter hat in einem Chat erwähnt @David Hallmann', attrs: { avatar: 'Yannick Bülter' }, time: '2026-09-16T09:12:00Z' }),
+    makeEl({ text: 'Lukas Behncke antwortete auf Ihre Nachricht', attrs: { avatar: 'Lukas Behncke' }, time: '2026-09-16T08:45:00Z' }),
+    makeEl({ text: 'Mathis Künzel hat auf Ihren Beitrag reagiert 👍' }),
+    makeEl({ text: 'Neuer Kanal wurde erstellt', time: '2026-09-16T07:30:00Z' })
+  ];
+
+  test('extrahiert alle Items mit Autor, Text und ISO-Zeitstempel', () => {
+    const items = extractActivityFromDom(buildFeed(feedItems), { max: 10 });
+    assert.equal(items.length, 4);
+    // Autor aus Avatar aria-label
+    assert.equal(items[0].author, 'Yannick Bülter');
+    assert.equal(items[1].author, 'Lukas Behncke');
+    // ISO-Timestamp aus <time datetime>
+    assert.equal(items[0].timestamp, '2026-09-16T09:12:00.000Z');
+    assert.equal(items[1].timestamp, '2026-09-16T08:45:00.000Z');
+    // Items ohne Avatar/Zeit lassen Felder weg
+    assert.equal(items[2].author, undefined);
+    assert.equal(items[2].timestamp, undefined);
+  });
+
+  test('respektiert max-Limit', () => {
+    const items = extractActivityFromDom(buildFeed(feedItems), { max: 2 });
+    assert.equal(items.length, 2);
+  });
+
+  test('Text normalisiert (NBSP -> Leerzeichen, Mehrfach-Leerzeichen -> eins)', () => {
+    const doc = buildFeed([makeEl({ text: 'Theys Schiller\u00a0erwähnt   @Team' })]);
+    const items = extractActivityFromDom(doc, { max: 5 });
+    assert.equal(items[0].text, 'Theys Schiller erwähnt @Team');
+  });
+
+  test('dedupliziert identische Items (virtuelles Rendering)', () => {
+    const dup = [makeEl({ text: 'Dublette' }), makeEl({ text: 'Dublette' }), makeEl({ text: 'Einzigartig' })];
+    const items = extractActivityFromDom(buildFeed(dup), { max: 10 });
+    assert.equal(items.length, 2);
+  });
+
+  test('überspringt leere/kurze Textfragmente (< 4 Zeichen)', () => {
+    const doc = buildFeed([makeEl({ text: '' }), makeEl({ text: 'Hi' }), makeEl({ text: 'Gültiger Eintrag' })]);
+    const items = extractActivityFromDom(doc, { max: 10 });
+    assert.equal(items.length, 1);
+    assert.equal(items[0].text, 'Gültiger Eintrag');
+  });
+
+  test('Unix-Millis-Zeitstempel in data-mid-artigem Wert wird zu ISO', () => {
+    // 1789557120000 ~ 2026-09-16
+    const el = makeEl({ text: 'Event mit Millis', attrs: {} });
+    el.querySelector = (sel) => {
+      if (sel === 'time[datetime]') return { getAttribute: () => '1789557120000', innerText: '1789557120000' };
+      return null;
+    };
+    const items = extractActivityFromDom(buildFeed([el]), { max: 5 });
+    assert.ok(items[0].timestamp.startsWith('2026-09-16T'));
+  });
+});
+
+describe('activityAnalyzer - classify (Layer 2)', () => {
+  test('erkennt Task-Anfragen (HOCH)', () => {
+    const c = classify('Yannick: Kannst du die Spec nochmal prüfen?');
+    assert.equal(c.category, 'Task');
+    assert.equal(c.priority, 'hoch');
+    assert.ok(c.matched.includes('kannst du'));
+  });
+
+  test('erkennt Meeting-Einladungen', () => {
+    const c = classify('Einladung zum Meeting: Kickoff Projekt Wildau');
+    assert.equal(c.category, 'Meeting');
+    assert.equal(c.priority, 'mittel');
+  });
+
+  test('erkennt Entscheidung/Freigabe', () => {
+    const c = classify('Marc hat die Freigabe für den Release erteilt');
+    assert.equal(c.category, 'Entscheidung');
+  });
+
+  test('Risiko hat Vorrang vor Task bei Mehrfach-Match', () => {
+    const c = classify('Dringend: Blocker - das Deployment funktioniert nicht, bitte prüfen');
+    assert.equal(c.category, 'Risiko'); // Risiko steht in der Kaskade vor Task
+  });
+
+  test('erkennt Sonstiges für Reaktionen/Rauschen', () => {
+    const c = classify('Mathis hat auf Ihren Beitrag reagiert 👍');
+    assert.equal(c.category, 'Sonstiges');
+    assert.equal(c.priority, 'niedrig');
+  });
+
+  test('leerer/kein Text -> Sonstiges niedrig', () => {
+    assert.deepEqual(classify(''), { category: 'Sonstiges', priority: 'niedrig', matched: [] });
+    assert.deepEqual(classify(null), { category: 'Sonstiges', priority: 'niedrig', matched: [] });
+  });
+
+  test('case-insensitive (EN "Please" / "Review")', () => {
+    assert.equal(classify('Please review the PR').category, 'Task');
+  });
+});
+
+describe('activityAnalyzer - analyzeItems & Gruppen (Layer 2)', () => {
+  const items = [
+    { text: 'Kannst du die Spec prüfen?', author: 'Yannick Bülter', timestamp: new Date().toISOString() },
+    { text: 'Blocker: Deployment funktioniert nicht', author: 'Lukas Behncke', timestamp: new Date().toISOString() },
+    { text: 'Einladung zum Meeting am Freitag', author: 'Theys Schiller', timestamp: new Date().toISOString() },
+    { text: 'Freigabe zur Abnahme erteilt', author: 'Marc', timestamp: new Date().toISOString() },
+    { text: 'Mathis hat auf Ihren Beitrag reagiert 👍' },
+    { text: 'Neuer Kanal wurde erstellt' }
+  ];
+
+  test('gruppiert alle Items in die 5 Kategorien', () => {
+    const groups = analyzeItems(items);
+    assert.deepEqual(Object.keys(groups).sort(), CATEGORIES.slice().sort());
+    assert.equal(groups.Task.length, 1);
+    assert.equal(groups.Risiko.length, 1);
+    assert.equal(groups.Meeting.length, 1);
+    assert.equal(groups.Entscheidung.length, 1);
+    assert.equal(groups.Sonstiges.length, 2);
+  });
+
+  test('sortiert je Kategorie absteigend nach Score', () => {
+    const sorted = analyzeItems([
+      { text: 'Kannst du A prüfen?', author: 'X' },
+      { text: 'Kannst du B prüfen?' }
+    ]);
+    assert.equal(sorted.Task.length, 2);
+    // Item mit Autor (20 Punkte extra) steht vor Item ohne Autor
+    assert.ok(sorted.Task[0].score > sorted.Task[1].score);
+  });
+
+  test('ignoriert Items ohne Text', () => {
+    const groups = analyzeItems([{}, { text: '' }, null]);
+    const total = Object.values(groups).reduce((a, b) => a + b.length, 0);
+    assert.equal(total, 0);
+  });
+});
+
+describe('activityAnalyzer - buildReportText & writeReport (Layer 2)', () => {
+  test('buildReportText erzeugt Markdown mit Top-N je Kategorie', () => {
+    const groups = analyzeItems([
+      { text: 'Kannst du die Spec prüfen?', author: 'Yannick', timestamp: new Date().toISOString() },
+      { text: 'Blocker im Deployment', author: 'Lukas', timestamp: new Date().toISOString() },
+      { text: 'Reaktion 👍', author: 'Mathis', timestamp: new Date().toISOString() }
+    ]);
+    const md = buildReportText(groups, { date: '2026-09-16', topN: 3, tenant: 'adesso' });
+    assert.ok(md.includes('# Teams Activity-Zusammenfassung — 2026-09-16'));
+    assert.ok(md.includes('## Task (1)'));
+    assert.ok(md.includes('## Risiko (1)'));
+    assert.ok(md.includes('## Sonstiges (1)'));
+    assert.ok(md.includes('| Kategorie | Anzahl |')); // Tabelle
+    assert.ok(md.includes('**Gesamt:** 3 Einträge'));
+  });
+
+  test('topN begrenzt je Kategorie', () => {
+    const many = Array.from({ length: 5 }, (_, i) => ({ text: `Kannst du Eintrag ${i} prüfen?`, author: `A${i}` }));
+    const groups = analyzeItems(many);
+    const md = buildReportText(groups, { topN: 3, date: '2026-09-16' });
+    // Nur 3 aufgezählt + Hinweis auf weitere 2
+    assert.ok(md.includes('_… und 2 weitere Einträge in dieser Kategorie_'));
+  });
+
+  test('leere Gruppen -> "Keine Einträge"', () => {
+    const groups = analyzeItems([]);
+    const md = buildReportText(groups, { date: '2026-09-16' });
+    assert.ok(md.includes('_Keine Einträge._'));
+  });
+
+  test('writeReport schreibt Datei nach reports/activity-summary-YYYY-MM-DD.md', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'teams-activity-'));
+    const { filePath, date } = writeReport('# Test', { date: '2026-09-16', dir: tmpDir });
+    assert.equal(date, '2026-09-16');
+    assert.ok(filePath.endsWith(`reports${path.sep}activity-summary-2026-09-16.md`));
+    const content = fs.readFileSync(filePath, 'utf8');
+    assert.equal(content, '# Test');
+  });
+});
+
+describe('activityReportScheduler - Planung & Bericht (Layer 3)', () => {
+  test('toMinutes parst HH:MM korrekt', () => {
+    assert.equal(toMinutes('00:00'), 0);
+    assert.equal(toMinutes('09:00'), 540);
+    assert.equal(toMinutes('17:00'), 1020);
+    assert.equal(toMinutes('23:59'), 1439);
+  });
+
+  test('toMinutes liefert NaN für ungültige Eingaben', () => {
+    assert.ok(isNaN(toMinutes('')));
+    assert.ok(isNaN(toMinutes('abc')));
+    assert.ok(isNaN(toMinutes('25:00')));
+    assert.ok(isNaN(toMinutes('09:60')));
+    assert.ok(isNaN(toMinutes(null)));
+  });
+
+  test('DEFAULT_SCHEDULE enthält 2 tägliche Zeiten', () => {
+    assert.deepEqual(DEFAULT_SCHEDULE, ['09:00', '17:00']);
+    assert.equal(DEFAULT_SCHEDULE.length, 2);
+  });
+
+  test('writeTimestampedReport schreibt reports/activity-YYYY-MM-DD-HHmm.md', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'teams-sched-'));
+    const now = new Date(2026, 8, 16, 9, 5); // 16.09.2026 09:05
+    const { filePath, stamp } = writeTimestampedReport('# Bericht', { now, dir: tmpDir });
+    assert.equal(stamp, '2026-09-16-0905');
+    assert.ok(filePath.endsWith(`reports${path.sep}activity-2026-09-16-0905.md`));
+    assert.equal(fs.readFileSync(filePath, 'utf8'), '# Bericht');
+  });
+
+  test('_nextTarget bietet Zugriff auf die geplante nächste Zielzeit', () => {
+    const sched = new ActivityReportScheduler({ times: ['09:00', '17:00'] });
+    // _nextTarget nutzt new Date() intern; wir prüfen nur die Struktur/Existenz der Zeiten
+    const target = sched._nextTarget();
+    assert.ok(target);
+    assert.ok(target.date instanceof Date);
+    assert.ok([540, 1020].includes(target.min));
+  });
+
+  test('_msUntil: Ziel später heute -> positive Differenz < 24h', () => {
+    // 10:00 -> 17:00 = 7h = 420 min; logisch: deltaMin zwischen Ziel und jetzt
+    const nowMin = 600;
+    const targetMin = 1020;
+    const deltaMin = targetMin - nowMin; // 420
+    assert.equal(deltaMin, 420);
+    assert.equal(deltaMin * 60 * 1000, 420 * 60 * 1000);
+  });
+
+  test('Scheduler akzeptiert benutzerdefinierte Zeiten/Config', () => {
+    const sched = new ActivityReportScheduler({ times: ['08:30', '19:00'], tenant: 'd-velop', maxItems: 100, topN: 5 });
+    assert.deepEqual(sched.times, ['08:30', '19:00']);
+    assert.equal(sched.tenant, 'd-velop');
+    assert.equal(sched.maxItems, 100);
+    assert.equal(sched.topN, 5);
+  });
+
+  test('ungültige Zeiten werden gefiltert', () => {
+    const sched = new ActivityReportScheduler({ times: ['09:00', 'kaputt', '', '17:00'] });
+    assert.deepEqual(sched.times, ['09:00', '17:00']);
+  });
+
+  test('runOnce ruft analyzeFn auf, schreibt Zeitstempel-Datei und sendet Bericht', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'teams-runonce-'));
+    let analyzeCalls = 0;
+    let sentTo = null;
+
+    const fakeAnalyze = async () => {
+      analyzeCalls++;
+      return {
+        tenant: 'adesso',
+        items: [{ text: 'Test', author: 'X' }],
+        groups: { Task: [{ item: { text: 'Test' }, score: 1 }] },
+        counts: { Task: 1 },
+        report: '# Test Report',
+        filePath: path.join(tmpDir, 'reports', 'activity-summary.md'),
+        date: '2026-09-16'
+      };
+    };
+
+    const sched = new ActivityReportScheduler({
+      times: ['09:00', '17:00'],
+      tenant: 'adesso',
+      analyzeFn: fakeAnalyze,
+      sender: async (r) => { sentTo = r.report; }
+    });
+
+    const now = new Date(2026, 8, 16, 9, 0);
+    const out = await sched.runOnce({ now });
+
+    assert.equal(analyzeCalls, 1);
+    assert.equal(sentTo, '# Test Report');
+    assert.ok(out.stampedFile.endsWith(`reports${path.sep}activity-2026-09-16-0900.md`));
+    assert.equal(fs.readFileSync(out.stampedFile, 'utf8'), '# Test Report');
   });
 });

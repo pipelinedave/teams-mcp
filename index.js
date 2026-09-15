@@ -223,6 +223,55 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             tenant: tenantParam()
           }
         }
+      },
+      {
+        name: 'teams_get_activity',
+        description: 'Extrahiert den "Aktivität"-Tab (Activity-Feed) aus Microsoft Teams als strukturierte Roh-Items (Text, Autor, Zeitstempel). Rohdaten ohne Klassifikation — für die Aufbereitung/Filterung an den Analyseschritt (tim-Agent) anbinden.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tenant: tenantParam(),
+            max_items: {
+              type: 'number',
+              description: 'Maximale Anzahl an Activity-Items (Standard: 50)',
+              default: 50
+            }
+          }
+        }
+      },
+      {
+        name: 'teams_analyze_activity',
+        description: 'Extrahiert den Activity-Feed UND klassifiziert die Einträge in Kategorien (Meeting, Task, Entscheidung, Risiko, Sonstiges) mit Relevanz-Scores. Liefert gruppierte Analyse ohne Datei-Schreiben.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tenant: tenantParam(),
+            max_items: {
+              type: 'number',
+              description: 'Maximale Anzahl an Activity-Items (Standard: 50)',
+              default: 50
+            }
+          }
+        }
+      },
+      {
+        name: 'teams_generate_activity_report',
+        description: 'Extrahiert + klassifiziert den Activity-Feed und speichert einen täglichen Markdown-Zusammenfassungs-Bericht (Top-3 pro Kategorie) nach reports/activity-summary-YYYY-MM-DD.md.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tenant: tenantParam(),
+            max_items: {
+              type: 'number',
+              description: 'Maximale Anzahl an Activity-Items (Standard: 50)',
+              default: 50
+            },
+            date: {
+              type: 'string',
+              description: 'Berichtsdatum YYYY-MM-DD (Standard: heute)'
+            }
+          }
+        }
       }
     ]
   };
@@ -353,6 +402,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await teamsClient.stopSpeakerTracking(tenant);
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+        };
+      }
+
+      case 'teams_get_activity': {
+        const tenant = resolveTenant(args?.tenant);
+        const result = await teamsClient.getActivity(tenant, {
+          maxItems: args?.max_items || 50
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+        };
+      }
+
+      case 'teams_analyze_activity': {
+        const tenant = resolveTenant(args?.tenant);
+        const result = await teamsClient.getAnalyzedActivity(tenant, {
+          maxItems: args?.max_items || 50
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+        };
+      }
+
+      case 'teams_generate_activity_report': {
+        const tenant = resolveTenant(args?.tenant);
+        const activity = await teamsClient.getActivity(tenant, {
+          maxItems: args?.max_items || 50
+        });
+        // Bericht über den Analyzer-Modulpfad erzeugen (Teil von teamsClient-Modul
+        // via import in index.js wäre zirkulär; daher direkt über Import hier).
+        const { runActivityReport } = await import('./src/activityAnalyzer.js');
+        const out = runActivityReport(activity.items, {
+          date: args?.date,
+          tenant: activity.tenant
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ filePath: out.filePath, date: out.date, counts: out.counts, report: out.report }, null, 2) }]
         };
       }
 

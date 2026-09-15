@@ -4,6 +4,8 @@ import TurndownService from 'turndown';
 import { browserManager } from './browserManager.js';
 import { config } from './config.js';
 import { speakerTracker } from './speakerTracker.js';
+import { activityClient } from './activityClient.js';
+import { analyzeItems, buildReportText, writeReport, CATEGORIES } from './activityAnalyzer.js';
 
 const turndown = new TurndownService({
   headingStyle: 'atx',
@@ -934,6 +936,30 @@ export class TeamsClient {
   async stopSpeakerTracking(tenant = '') {
     const t = browserManager.normalizeTenant(tenant);
     return await speakerTracker.stopTracking(t);
+  }
+
+  // Layer 1: Extrahiert den "Aktivität"-Tab (Activity-Feed) aus dem Teams-Web-DOM.
+  // Die Roh-Items werden hier nicht klassifiziert (das macht der tim-Agent / die
+  // Nachbearbeitung in Layer 2/3) — dieses Tool liefert nur die stabilen Rohdaten.
+  async getActivity(tenant = '', options = {}) {
+    return await activityClient.getActivity(tenant, options);
+  }
+
+  // Layer 2: Extrahiert den Activity-Feed UND klassifiziert die Einträge in
+  // Kategorien (Meeting/Task/Entscheidung/Risiko/Sonstiges). Liefert die Gruppen
+  // mit Relevanz-Scores, ohne eine Datei zu schreiben (reine Analyse).
+  async getAnalyzedActivity(tenant = '', { maxItems = 50 } = {}) {
+    const activity = await activityClient.getActivity(tenant, { maxItems });
+    const groups = analyzeItems(activity.items);
+    const counts = {};
+    for (const cat of CATEGORIES) counts[cat] = groups[cat]?.length || 0;
+    return {
+      tenant: activity.tenant,
+      extractedAt: activity.extractedAt,
+      total: activity.count,
+      counts,
+      groups
+    };
   }
 }
 
