@@ -514,91 +514,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
  * @returns {Promise<{content: Array<{type: string, text: string}>}>}
  */
 async function handleScheduleActivityReport(action, args) {
-  // Konfiguration ggf. anpassen (tenant + maxItems + times)
-  const wantTenant = args?.tenant ? resolveTenant(args.tenant) : activityScheduler.tenant;
-  const wantMax = args?.max_items || activityScheduler.maxItems;
-  const applyConfig = () => {
-    let changed = false;
-    if (wantTenant !== activityScheduler.tenant) { activityScheduler.tenant = wantTenant; changed = true; }
-    if (wantMax !== activityScheduler.maxItems) { activityScheduler.maxItems = wantMax; changed = true; }
-    if (Array.isArray(args?.times) && args.times.length) { activityScheduler.times = args.times.filter((t) => !isNaN(toMinutes(t))); changed = true; }
-    return changed;
-  };
-
-  switch (action) {
-    case 'status': {
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({
-            running: activityScheduler._running,
-            tenant: activityScheduler.tenant,
-            times: activityScheduler.times,
-            maxItems: activityScheduler.maxItems,
-            topN: activityScheduler.topN,
-            lastFired: activityScheduler._lastFired,
-            reportsDir: `${activityScheduler.dir}/reports`
-          }, null, 2)
-        }]
-      };
-    }
-
-    case 'config': {
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({
-            running: activityScheduler._running,
-            tenant: activityScheduler.tenant,
-            times: activityScheduler.times,
-            maxItems: activityScheduler.maxItems,
-            topN: activityScheduler.topN,
-            dir: activityScheduler.dir
-          }, null, 2)
-        }]
-      };
-    }
-
-    case 'start': {
-      applyConfig();
-      if (activityScheduler._running) {
-        return { content: [{ type: 'text', text: JSON.stringify({ started: false, alreadyRunning: true, times: activityScheduler.times }, null, 2) }] };
-      }
-      activityScheduler.start();
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({ started: true, times: activityScheduler.times, tenant: activityScheduler.tenant }, null, 2)
-        }]
-      };
-    }
-
-    case 'stop': {
-      activityScheduler.stop();
-      return { content: [{ type: 'text', text: JSON.stringify({ stopped: true }, null, 2) }] };
-    }
-
-    case 'run-once': {
-      applyConfig();
-      const out = await activityScheduler.runOnce();
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({
-            date: out.date,
-            tenant: out.tenant,
-            counts: out.counts,
-            filePath: out.filePath,
-            stampedFile: out.stampedFile,
-            report: out.report
-          }, null, 2)
-        }]
-      };
-    }
-
-    default:
-      return { content: [{ type: 'text', text: JSON.stringify({ error: `Unbekannte Aktion: ${action}` }, null, 2) }] };
-  }
+  const result = await runSchedulerControl({
+    action,
+    scheduler: activityScheduler,
+    tenant: args?.tenant,
+    maxItems: args?.max_items,
+    times: args?.times,
+    resolveTenant
+  });
+  return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
 }
 
 async function run() {

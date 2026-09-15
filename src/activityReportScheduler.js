@@ -250,3 +250,96 @@ export class ActivityReportScheduler {
 }
 
 export const activityReportScheduler = new ActivityReportScheduler();
+
+/**
+ * Zentrale Steuerungslogik für den Scheduler (status/start/stop/run-once/config).
+ *
+ * Als pure, exportierte Funktion gebaut, damit sie in Unit-Tests ohne MCP-Kanal
+ * prüfbar ist. Der index.js-Handler ruft sie nur noch auf und verpackt das Ergebnis
+ * in eine MCP-Text-Antwort.
+ *
+ * @param {object} opts
+ * @param {string} [opts.action] - 'status' | 'start' | 'stop' | 'run-once' | 'config' (Standard 'status')
+ * @param {ActivityReportScheduler} [opts.scheduler] - injizierbarer Scheduler (Standard activityReportScheduler)
+ * @param {string} [opts.tenant]
+ * @param {number} [opts.maxItems]
+ * @param {string[]} [opts.times]
+ * @param {function} [opts.resolveTenant] - tenant-Resolver (falls nötig)
+ * @returns {Promise<object>} serialisierbares Ergebnis
+ */
+export async function runSchedulerControl({
+  action = 'status',
+  scheduler = activityReportScheduler,
+  tenant,
+  maxItems,
+  times,
+  resolveTenant = null
+} = {}) {
+  const applyConfig = () => {
+    let changed = false;
+    const wantTenant = tenant ? (resolveTenant ? resolveTenant(tenant) : tenant) : scheduler.tenant;
+    const wantMax = maxItems || scheduler.maxItems;
+    if (wantTenant !== scheduler.tenant) { scheduler.tenant = wantTenant; changed = true; }
+    if (wantMax !== scheduler.maxItems) { scheduler.maxItems = wantMax; changed = true; }
+    if (Array.isArray(times) && times.length) {
+      const valid = times.filter((t) => !isNaN(toMinutes(t)));
+      if (valid.length) { scheduler.times = valid; changed = true; }
+    }
+    return changed;
+  };
+
+  switch (action) {
+    case 'status': {
+      return {
+        running: scheduler._running,
+        tenant: scheduler.tenant,
+        times: scheduler.times,
+        maxItems: scheduler.maxItems,
+        topN: scheduler.topN,
+        lastFired: scheduler._lastFired,
+        reportsDir: `${scheduler.dir}/reports`
+      };
+    }
+
+    case 'config': {
+      return {
+        running: scheduler._running,
+        tenant: scheduler.tenant,
+        times: scheduler.times,
+        maxItems: scheduler.maxItems,
+        topN: scheduler.topN,
+        dir: scheduler.dir
+      };
+    }
+
+    case 'start': {
+      applyConfig();
+      if (scheduler._running) {
+        return { started: false, alreadyRunning: true, times: scheduler.times };
+      }
+      scheduler.start();
+      return { started: true, times: scheduler.times, tenant: scheduler.tenant };
+    }
+
+    case 'stop': {
+      scheduler.stop();
+      return { stopped: true };
+    }
+
+    case 'run-once': {
+      applyConfig();
+      const out = await scheduler.runOnce();
+      return {
+        date: out.date,
+        tenant: out.tenant,
+        counts: out.counts,
+        filePath: out.filePath,
+        stampedFile: out.stampedFile,
+        report: out.report
+      };
+    }
+
+    default:
+      return { error: `Unbekannte Aktion: ${action}` };
+  }
+}

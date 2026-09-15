@@ -8,7 +8,7 @@ import { browserManager } from '../src/browserManager.js';
 import { cleanSpeakerName, aggregateEvents, isBotOrUiName } from '../src/speakerTracker.js';
 import { extractActivityFromDom } from '../src/activityClient.js';
 import { classify, analyzeItems, buildReportText, writeReport, CATEGORIES } from '../src/activityAnalyzer.js';
-import { toMinutes, writeTimestampedReport, ActivityReportScheduler, DEFAULT_SCHEDULE } from '../src/activityReportScheduler.js';
+import { toMinutes, writeTimestampedReport, ActivityReportScheduler, DEFAULT_SCHEDULE, runSchedulerControl } from '../src/activityReportScheduler.js';
 
 // Instanz des TeamsClient (nur zur Nutzung der puren pickChatRow-Methode)
 const client = new TeamsClient();
@@ -566,5 +566,152 @@ describe('activityReportScheduler - Planung & Bericht (Layer 3)', () => {
     assert.equal(sentTo, '# Test Report');
     assert.ok(out.stampedFile.endsWith(`reports${path.sep}activity-2026-09-16-0900.md`));
     assert.equal(fs.readFileSync(out.stampedFile, 'utf8'), '# Test Report');
+  });
+
+  test('runSchedulerControl - status liefert Laufzustand + Konfig', async () => {
+    const fake = {
+      _running: true,
+      tenant: 'adesso',
+      times: ['09:00', '17:00'],
+      maxItems: 50,
+      topN: 10,
+      _lastFired: null,
+      dir: '/tmp',
+      start() {}, stop() {}, runOnce: async () => ({})
+    };
+    const res = await runSchedulerControl({ action: 'status', scheduler: fake });
+    assert.equal(res.running, true);
+    assert.equal(res.tenant, 'adesso');
+    assert.deepEqual(res.times, ['09:00', '17:00']);
+    assert.ok(res.reportsDir.endsWith('reports'));
+  });
+
+  test('runSchedulerControl - run-once delegiert an scheduler.runOnce', async () => {
+    const fake = {
+      _running: false,
+      tenant: 'adesso',
+      times: ['09:00', '17:00'],
+      maxItems: 50,
+      topN: 10,
+      dir: '/tmp',
+      start() {}, stop() {},
+      runOnce: async () => ({ date: '2026-09-16', tenant: 'adesso', counts: { Task: 1 }, filePath: 'x.md', stampedFile: 'x.md', report: '# R' })
+    };
+    const res = await runSchedulerControl({ action: 'run-once', scheduler: fake });
+    assert.equal(res.date, '2026-09-16');
+    assert.equal(res.report, '# R');
+  });
+
+  test('runSchedulerControl - start/stop schalten den Scheduler', async () => {
+    let started = false;
+    let stopped = false;
+    const fake = {
+      _running: false,
+      tenant: 'adesso',
+      times: ['09:00', '17:00'],
+      maxItems: 50,
+      topN: 10,
+      dir: '/tmp',
+      start() { started = true; this._running = true; },
+      stop() { stopped = true; this._running = false; },
+      runOnce: async () => ({})
+    };
+    const s = await runSchedulerControl({ action: 'start', scheduler: fake });
+    assert.equal(s.started, true);
+    assert.equal(started, true);
+    const st = await runSchedulerControl({ action: 'stop', scheduler: fake });
+    assert.equal(st.stopped, true);
+    assert.equal(stopped, true);
+  });
+
+  test('runSchedulerControl - unbekannte Aktion -> error', async () => {
+    const fake = { _running: false, tenant: 'adesso', times: ['09:00'], maxItems: 50, topN: 10, dir: '/tmp', start() {}, stop() {}, runOnce: async () => ({}) };
+    const res = await runSchedulerControl({ action: 'unbekannt', scheduler: fake });
+    assert.ok(res.error);
+  });
+});
+
+describe('runSchedulerControl - zentrale Scheduler-Steuerung (MCP-Tool)', () => {
+  test('status liefert Konfig + Laufzustand', async () => {
+    const sched = new ActivityReportScheduler({ times: ['09:00', '17:00'], tenant: 'adesso' });
+    const res = await runSchedulerControl({ action: 'status', scheduler: sched });
+    assert.equal(res.running, false);
+    assert.deepEqual(res.times, ['09:00', '17:00']);
+    assert.equal(res.tenant, 'adesso');
+    assert.equal(res.maxItems, 50);
+    assert.ok(res.reportsDir.endsWith(`${path.sep}reports`));
+  });
+
+  test('config liefert Konfiguration inkl. dir', async () => {
+    const sched = new ActivityReportScheduler({ times: ['08:00'], dir: '/tmp/x' });
+    const res = await runSchedulerControl({ action: 'config', scheduler: sched });
+    assert.deepEqual(res.times, ['08:00']);
+    assert.equal(res.dir, '/tmp/x');
+    assert.equal(res.topN, 3);
+  });
+
+  test('start aktiviert Scheduler; erneuter start meldet alreadyRunning', async () => {
+    const sched = new ActivityReportScheduler({ times: ['09:00', '17:00'] });
+    const started = await runSchedulerControl({ action: 'start', scheduler: sched });
+    assert.equal(started.started, true);
+    assert.equal(sched._running, true);
+
+    const again = await runSchedulerControl({ action: 'start', scheduler: sched });
+    assert.equal(again.started, false);
+    assert.equal(again.alreadyRunning, true);
+
+    await runSchedulerControl({ action: 'stop', scheduler: sched });
+    assert.equal(sched._running, false);
+  });
+
+  test('stop setzt _running zurück und liefert stopped:true', async () => {
+    const sched = new ActivityReportScheduler({});
+    sched.start();
+    assert.equal(sched._running, true);
+    const res = await runSchedulerControl({ action: 'stop', scheduler: sched });
+    assert.equal(res.stopped, true);
+    assert.equal(sched._running, false);
+  });
+
+  test('start übernimmt tenant/maxItems/times aus args', async () => {
+    const sched = new ActivityReportScheduler({ times: ['09:00'], tenant: 'adesso' });
+    await runSchedulerControl({
+      action: 'start',
+      scheduler: sched,
+      tenant: 'd-velop',
+      maxItems: 100,
+      times: ['08:00', '19:00', 'kaputt'],
+      resolveTenant: (t) => t
+    });
+    assert.equal(sched.tenant, 'd-velop');
+    assert.equal(sched.maxItems, 100);
+    assert.deepEqual(sched.times, ['08:00', '19:00']);
+    await runSchedulerControl({ action: 'stop', scheduler: sched });
+  });
+
+  test('run-once führt analyzeFn aus und liefert Report-Metadaten', async () => {
+    const sched = new ActivityReportScheduler({
+      times: ['09:00'],
+      analyzeFn: async () => ({
+        tenant: 'adesso',
+        items: [],
+        groups: {},
+        counts: { Meeting: 0, Task: 1, Entscheidung: 0, Risiko: 0, Sonstiges: 0 },
+        report: '# Test',
+        filePath: '/tmp/reports/activity-summary.md',
+        date: '2026-09-16'
+      })
+    });
+    const res = await runSchedulerControl({ action: 'run-once', scheduler: sched });
+    assert.equal(res.date, '2026-09-16');
+    assert.equal(res.tenant, 'adesso');
+    assert.equal(res.report, '# Test');
+    assert.ok(res.stampedFile);
+  });
+
+  test('unbekannte Aktion liefert Fehler-Feld', async () => {
+    const res = await runSchedulerControl({ action: 'kaputt', scheduler: new ActivityReportScheduler({}) });
+    assert.ok(res.error);
+    assert.match(res.error, /Unbekannte Aktion/);
   });
 });
