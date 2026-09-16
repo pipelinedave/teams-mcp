@@ -176,6 +176,40 @@ ist registriert und der Scheduler läuft mit `running: true`, `tenant: "adesso"`
 (EnV `TEAMS_MCP_ACTIVITY_SCHEDULER=0` deaktiviert, `TEAMS_MCP_ACTIVITY_TIMES` überschreibt
 die Zeiten).
 
+### Zustellung (Layer 4) – Abschlussbericht (Stand 16.09.2026)
+
+Die Zustellkette für den proaktiven Activity-Bericht ist fertiggestellt und verifiziert.
+Sie überbrückt robust die Prozessgrenze zwischen `teams-mcp` (MCP-Server) und dem
+`tim`-Agenten (opencode-Subagent), ohne dass der Nutzer den Aktivitätstab selbst
+anklicken muss. Zentrale Idee: **Outbox als entkoppelter Übergabepunkt**.
+
+**Ablauf (End-to-End):**
+
+1. **Scheduler erzeugt Bericht** – Zur konfigurierten Zeit (`09:00`/`17:00`) führt
+   Layer 3 (`activityReportScheduler`) die Analyse aus und speichert den Markdown-Report
+   nach `reports/activity-YYYY-MM-DD-HHmm.md`.
+2. **Sender legt Outbox-Nachricht an** – Der in `index.js` verdrahtete
+   `createOutboxSender()` (aus `src/reportDelivery.js`) serialisiert das Bericht-Ergebnis
+   als strukturierte JSON-Nachricht nach `reports/outbox/activity-delivery-*.json`
+   (Kind `teams-activity-report`, Recipient `tim`, inkl. `report`, `counts`, `tenant`,
+   `date`).
+3. **tim-Agent holt ab** – Der `tim`-Agent ruft `teams_list_pending_deliveries` auf,
+   erhält die chronologisch sortierten, noch nicht übergebenen Nachrichten und präsentiert
+   den Bericht proaktiv an den Nutzer (im "Chat mit mir").
+4. **Übergabe bestätigen** – Der `tim`-Agent markiert die Zustellung via
+   `teams_mark_delivered` als übergeben. Dadurch wird die Datei auf
+   `*.delivered.json` umbenannt und von `listPendingDeliveries` künftig übersprungen –
+   **kein Doppel-Versand**.
+
+**Verifikation:** `npm test` 79/79 grün (inkl. Outbox- und Self-Chat-Name-Tests),
+`npm run check` syntaktisch sauber. End-to-End-Demo: `node tests/report-delivery.demo.mjs`
+(Outbox → tim-Agent → übergeben, ohne echten Browser).
+
+**Design-Merkmale:** Keine Prozesskopplung (nur Datei-Outbox); kanonische
+`extractSelfNameFromTitle`-Logik für die Self-Chat-Erkennung in `src/reportDelivery.js`;
+kaputte Outbox-Dateien werden über stderr geloggt und übersprungen, ohne die Kette zu
+stören.
+
 ## Projektstruktur
 
 ```
