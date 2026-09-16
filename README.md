@@ -131,7 +131,7 @@ Für andere MCP-Clients (Claude Desktop, Cursor, …) starte den Server entsprec
 
 Das Toolset kann den Teams-**Aktivitätstab** systematisch auslesen, klassifizieren und dir
 als **proaktiven Bericht** präsentieren – damit du den Tab nicht selbst anklicken musst.
-Drei-Schichten-Architektur:
+Vier-Schichten-Architektur:
 
 | Schicht | Datei | Zweck |
 |---|---|---|
