@@ -227,7 +227,7 @@ export class TeamsClient {
     const activeChat = await this.getActiveChatTitle(page);
     await page.waitForSelector('[data-tid="chat-pane-message"], .fui-ChatMessage__body, .fui-ChatMyMessage__body', { timeout: 15000 }).catch(() => null);
 
-    const messagesData = await page.evaluate(({ max, selfName, helperStr }) => {
+    const messagesData = await page.evaluate(async ({ max, selfName, helperStr, blobTimeoutMs }) => {
       const toIso = new Function('return (' + helperStr + ')')();
       const msgs = [];
       const msgBodies = Array.from(document.querySelectorAll('[data-tid="chat-pane-message"], .fui-ChatMessage__body, .fui-ChatMyMessage__body'));
@@ -305,20 +305,132 @@ export class TeamsClient {
           timestampRaw: timestampRaw || undefined
         });
       }
-      return msgs;
-    }, { max: limit, selfName: config.selfName, helperStr: messageTimeToIso.toString() });
+
+      // Nur Nachrichten-Bilder behandeln: Teams nutzt blob:-URLs auch für flüchtige UI-Icons
+      // (Buttons, Avatare, Reaktionen/Sticker). Diese dürfen NICHT als Nachrichten-Medien gelten.
+      const isUiControl = (el) => {
+        let cur = el.parentElement;
+        while (cur && cur !== document.body) {
+          const tag = cur.tagName;
+          const cls = typeof cur.className === 'string' ? cur.className : '';
+          if (tag === 'BUTTON' || tag === 'A' || cur.getAttribute('role') === 'button' ||
+              cls.includes('fui-Button') || cls.includes('fui-Avatar') || cls.includes('fui-CounterBadge')) {
+            return true;
+          }
+          if (/react|Reaction|sticker|Picker/i.test(cls)) return true;
+          cur = cur.parentElement;
+        }
+        return false;
+      };
+      const isInMessageArea = (el) => {
+        let cur = el.parentElement;
+        while (cur && cur !== document.body) {
+          const cls = typeof cur.className === 'string' ? cur.className : '';
+          if (cls.includes('fui-ChatMessage') || cls.includes('fui-ChatMyMessage') || cur.getAttribute('role') === 'listitem') return true;
+          cur = cur.parentElement;
+        }
+        return false;
+      };
+
+      // Je Nachricht die blob:-URLs aus dem gesamten Message-Container sammeln (Bilder können
+      // als Attachment neben dem reinen Text-Body liegen). Reine UI-Icons werden ausgefiltert.
+      const msgRowFor = (body) => body.closest('.fui-ChatMessage, .fui-ChatMyMessage, [role="listitem"], [role="group"]') || body;
+      const rowBlobUrls = msgs.map((m, i) => {
+        const row = msgRowFor(slice[i]);
+        if (!row) return [];
+        return Array.from(row.querySelectorAll('img[src^="blob:"]'))
+          .filter((img) => !isUiControl(img))
+          .map((img) => img.getAttribute('src') || img.src)
+          .filter(Boolean);
+      });
+
+      // Inline-Screenshots/Bilder: blob:-URLs sind nur in der laufenden Browser-Session gültig.
+      // Sie müssen HIER im Browser per fetch() + FileReader zu dataURLs aufgelöst werden
+      // (Node kann Blob-URLs nicht lesen). 3s-Timeout pro Bild, Fehler blockieren nie.
+      const blobData = {};
+      try {
+        const blobImgs = Array.from(document.querySelectorAll('img[src^="blob:"]'))
+          .filter((img) => !isUiControl(img) && isInMessageArea(img));
+        const urls = Array.from(new Set(blobImgs.map((img) => img.getAttribute('src') || img.src).filter(Boolean)));
+        await Promise.all(urls.map(async (url) => {
+          let dataUrl = null;
+          try {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), blobTimeoutMs);
+            try {
+              const res = await fetch(url, { signal: ctrl.signal, cache: 'no-store' });
+              if (res && res.ok) {
+                const blob = await res.blob();
+                dataUrl = await new Promise((resolve) => {
+                  const fr = new FileReader();
+                  fr.onload = () => resolve(fr.result || null);
+                  fr.onerror = () => resolve(null);
+                  fr.readAsDataURL(blob);
+                });
+              }
+            } finally {
+              clearTimeout(timer);
+            }
+          } catch { dataUrl = null; }
+          blobData[url] = dataUrl;
+        }));
+      } catch { /* Blob-Extraktion scheitert nie fatal: Nachrichten bleiben erhalten */ }
+
+      return { msgs, blobData, rowBlobUrls };
+    }, { max: limit, selfName: config.selfName, helperStr: messageTimeToIso.toString(), blobTimeoutMs: 3000 });
+
+    const { msgs, blobData, rowBlobUrls } = messagesData;
+
+    // Persistiert erfolgreich aufgelöste Blobs als lokale Dateien und liefert
+    // eine Map { blobUrl -> file:///Pfad }, um blob:-URLs im HTML/Markdown zu ersetzen.
+    const blobUrlToPath = {};
+    const mediaDir = ensureMediaDir(config.mediaDir);
+    if (blobData && typeof blobData === 'object') {
+      const chatToken = sanitizeFilename(activeChat || chatName || 'chat');
+      const timeToken = Date.now();
+      let index = 0;
+      for (const [blobUrl, dataUrl] of Object.entries(blobData)) {
+        if (!dataUrl) continue; // fehlgeschlagener Blob -> nicht blockieren
+        const filename = `${sanitizeFilename(t)}_${chatToken}_${timeToken}_${index}`;
+        const res = saveBlobDataUrl(dataUrl, mediaDir, filename);
+        if (res.saved) {
+          blobUrlToPath[blobUrl] = `file://${res.filePath}`;
+          index += 1;
+        }
+      }
+    }
+
+    // Bilder, die in einem Message-Container (Row) liegen, aber NICHT im reinen Text-Body:
+    // werden als eigenständige Bild-Referenz ans Ende des Markdown angehängt.
+    const appendRowMedia = (mIndex, content) => {
+      const rowUrls = (rowBlobUrls && rowBlobUrls[mIndex]) || [];
+      const lines = [];
+      for (const url of rowUrls) {
+        const p = blobUrlToPath[url];
+        if (p && !content.includes(p)) lines.push(`![media](${p})`);
+      }
+      return lines.length ? `${content}\n\n${lines.join('\n')}` : content;
+    };
 
     return {
       tenant: t,
       chat: activeChat,
-      count: messagesData.length,
-      messages: messagesData.map(m => ({
-        author: m.author,
-        content: turndown.turndown(m.html || m.text),
-        mid: m.mid,
-        timestamp: m.timestamp,
-        timestampRaw: m.timestampRaw
-      }))
+      count: msgs.length,
+      messages: msgs.map((m, i) => {
+        const htmlWithMedia = replaceBlobUrlsInHtml(m.html, blobUrlToPath);
+        let content = turndown.turndown(htmlWithMedia || m.text);
+        content = appendRowMedia(i, content);
+        return {
+          author: m.author,
+          content,
+          mid: m.mid,
+          timestamp: m.timestamp,
+          timestampRaw: m.timestampRaw,
+          mediaFiles: (rowBlobUrls && rowBlobUrls[i] || [])
+            .map((url) => blobUrlToPath[url])
+            .filter(Boolean)
+        };
+      })
     };
   }
 
@@ -985,6 +1097,90 @@ export function messageTimeToIso(raw) {
     if (!isNaN(d.getTime())) return d.toISOString();
   }
   return null;
+}
+
+// Mime-Type -> Dateiendung für persistierte Teams-Medien (Fallback .bin).
+export function mimeToExt(mime) {
+  if (!mime) return 'bin';
+  const m = String(mime).split(';')[0].trim().toLowerCase();
+  const map = {
+    'image/png': 'png',
+    'image/jpeg': 'jpg',
+    'image/jpg': 'jpg',
+    'image/gif': 'gif',
+    'image/webp': 'webp',
+    'image/bmp': 'bmp',
+    'image/svg+xml': 'svg',
+    'image/avif': 'avif'
+  };
+  return map[m] || 'bin';
+}
+
+// Ersetzt Zeichen, die in Dateinamen problematisch sind (auch für tenant/chatName-Anteile).
+export function sanitizeFilename(name, maxLen = 50) {
+  const cleaned = String(name ?? '')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .trim();
+  return cleaned.slice(0, maxLen) || 'unknown';
+}
+
+// Konvertiert eine dataURL ("data:<mime>;base64,<...>") und schreibt sie als Datei.
+// Liefert { filePath, ext, saved } oder { saved: false } bei ungültiger dataURL.
+export function saveBlobDataUrl(dataUrl, mediaDir, filename) {
+  if (!dataUrl || typeof dataUrl !== 'string' || !dataUrl.startsWith('data:')) {
+    return { saved: false };
+  }
+  const match = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(dataUrl);
+  if (!match) return { saved: false };
+
+  const mime = match[1] || '';
+  const isBase64 = Boolean(match[2]);
+  const payload = match[3] || '';
+  let buf;
+  try {
+    buf = isBase64 ? Buffer.from(payload, 'base64') : Buffer.from(decodeURIComponent(payload), 'utf8');
+  } catch {
+    return { saved: false };
+  }
+  if (!buf || buf.length === 0) return { saved: false };
+
+  const ext = mimeToExt(mime);
+  const filePath = path.join(mediaDir, `${filename}.${ext}`);
+  try {
+    fs.writeFileSync(filePath, buf);
+    return { saved: true, filePath, ext };
+  } catch {
+    return { saved: false };
+  }
+}
+
+// Ersetzt in HTML alle img-src="blob:..." (und srcset) durch die lokalen Dateipfade aus dem Mapping.
+// blobUrlToPath: Map/Objekt { blobUrl -> file:// Pfad }. Nicht gemappte Blobs bleiben unverändert.
+export function replaceBlobUrlsInHtml(html, blobUrlToPath = {}) {
+  if (!html) return html;
+  const mapEntries = Object.entries(blobUrlToPath);
+  if (mapEntries.length === 0) return html;
+
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  let out = html;
+  for (const [blobUrl, filePath] of mapEntries) {
+    if (!filePath) continue;
+    const qEsc = esc(blobUrl);
+    // src="blob:..." und src='blob:...'
+    out = out.replace(new RegExp(`src=["']${qEsc}["']`, 'g'), `src="${filePath}"`);
+    // srcset (Comma-getrennt "url 1x, url 2x") — nur den exakten URL-Teil ersetzen
+    out = out.replace(new RegExp(qEsc, 'g'), filePath);
+  }
+  return out;
+}
+
+// Erstellt (falls nötig) das Medienverzeichnis und liefert den absoluten Pfad zurück.
+export function ensureMediaDir(mediaDir) {
+  fs.mkdirSync(mediaDir, { recursive: true });
+  return mediaDir;
 }
 
 export const teamsClient = new TeamsClient();

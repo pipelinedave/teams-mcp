@@ -3,7 +3,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { TeamsClient, messageTimeToIso } from '../src/teamsClient.js';
+import {
+  TeamsClient,
+  messageTimeToIso,
+  mimeToExt,
+  sanitizeFilename,
+  saveBlobDataUrl,
+  replaceBlobUrlsInHtml,
+  ensureMediaDir
+} from '../src/teamsClient.js';
 import { browserManager } from '../src/browserManager.js';
 import { cleanSpeakerName, aggregateEvents, isBotOrUiName } from '../src/speakerTracker.js';
 import { extractActivityFromDom } from '../src/activityClient.js';
@@ -785,5 +793,77 @@ describe('reportDelivery - Zustell-Outbox für den tim-Agenten', () => {
   test('listPendingDeliveries liefert [] wenn Outbox fehlt', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'teams-delivery-'));
     assert.deepEqual(listPendingDeliveries({ dir: tmpDir }), []);
+  });
+});
+
+describe('Teams-Medien-Persistierung (blob: -> lokale Datei)', () => {
+  test('mimeToExt mappt bekannte MIME-Typen, Fallback .bin', () => {
+    assert.equal(mimeToExt('image/png'), 'png');
+    assert.equal(mimeToExt('image/jpeg'), 'jpg');
+    assert.equal(mimeToExt('image/gif'), 'gif');
+    assert.equal(mimeToExt('image/webp'), 'webp');
+    assert.equal(mimeToExt('application/octet-stream'), 'bin');
+    assert.equal(mimeToExt(null), 'bin');
+    assert.equal(mimeToExt(''), 'bin');
+  });
+
+  test('sanitizeFilename entfernt unzulässige Zeichen, Whitespace und kürzt', () => {
+    assert.equal(sanitizeFilename('a/b\\c:d*e?f"g<h>i|j'), 'a_b_c_d_e_f_g_h_i_j');
+    assert.equal(sanitizeFilename('  Hallo   Welt  '), 'Hallo_Welt');
+    assert.equal(sanitizeFilename(''), 'unknown');
+    assert.equal(sanitizeFilename(null, 5), 'unknown');
+    const long = 'x'.repeat(200);
+    assert.equal(sanitizeFilename(long, 50).length, 50);
+  });
+
+  test('saveBlobDataUrl schreibt eine dataURL-Bilddatei mit korrekter Endung in das Zielverzeichnis', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'teams-media-'));
+    // minimales 1x1 PNG
+    const pngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+    const dataUrl = `data:image/png;base64,${pngBase64}`;
+
+    const res = saveBlobDataUrl(dataUrl, tmpDir, 'tenant_chat_1_0');
+    assert.equal(res.saved, true);
+    assert.equal(res.ext, 'png');
+    assert.ok(res.filePath.endsWith('tenant_chat_1_0.png'));
+    assert.ok(fs.existsSync(res.filePath));
+    const buf = fs.readFileSync(res.filePath);
+    assert.ok(buf.length > 0);
+  });
+
+  test('saveBlobDataUrl liefert saved:false bei ungültigen dataURLs', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'teams-media-'));
+    assert.deepEqual(saveBlobDataUrl(null, tmpDir, 'x'), { saved: false });
+    assert.deepEqual(saveBlobDataUrl('not-a-dataurl', tmpDir, 'x'), { saved: false });
+    assert.deepEqual(saveBlobDataUrl('data:image/png;base64,', tmpDir, 'x'), { saved: false });
+  });
+
+  test('replaceBlobUrlsInHtml ersetzt blob:-URLs durch die lokalen Dateipfade', () => {
+    const html = '<p>Hallo <img src="blob:https://teams/abc-123" alt="shot"></p>';
+    const map = { 'blob:https://teams/abc-123': 'file:///home/u/.teams-media/tenant_chat_1_0.png' };
+    const out = replaceBlobUrlsInHtml(html, map);
+    assert.ok(out.includes('src="file:///home/u/.teams-media/tenant_chat_1_0.png"'));
+    assert.ok(!out.includes('blob:'));
+  });
+
+  test('replaceBlobUrlsInHtml lässt unbehandelte Blobs unangetastet und ist gegen leere Eingaben robust', () => {
+    const html = '<img src="blob:unmapped">';
+    assert.equal(replaceBlobUrlsInHtml(html, {}), html);
+    assert.equal(replaceBlobUrlsInHtml('', { a: 'b' }), '');
+    assert.equal(replaceBlobUrlsInHtml(null, { a: 'b' }), null);
+  });
+
+  test('replaceBlobUrlsInHtml ersetzt auch single-quoted src', () => {
+    const html = `<img src='blob:https://teams/xyz'>`;
+    const out = replaceBlobUrlsInHtml(html, { 'blob:https://teams/xyz': 'file:///p.png' });
+    assert.ok(out.includes('src="file:///p.png"'));
+  });
+
+  test('ensureMediaDir erstellt das Verzeichnis rekursiv', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'teams-media-'));
+    const nested = path.join(base, 'a', 'b');
+    ensureMediaDir(nested);
+    assert.ok(fs.existsSync(nested));
+    assert.ok(fs.statSync(nested).isDirectory());
   });
 });

@@ -94,6 +94,12 @@ function getDefaultHeadless() {
   return String(v).toLowerCase() !== 'false' && v !== '0';
 }
 
+// Basis-Verzeichnis für persistierte Teams-Medien (Inline-Screenshots/Bilder).
+// Per TEAMS_MCP_MEDIA_DIR überschreibbar, Standard: ~/.teams-media
+function getMediaDir() {
+  return process.env.TEAMS_MCP_MEDIA_DIR || path.join(HOME, '.teams-media');
+}
+
 // Aktivität-Scheduler: geplanter proaktiver Activity-Bericht (Standard 09:00 + 17:00).
 // Per TEAMS_MCP_ACTIVITY_SCHEDULER=0/false deaktivierbar; Times per
 // TEAMS_MCP_ACTIVITY_TIMES (Komma-getrennt HH:MM) überschreibbar.
@@ -126,5 +132,6 @@ export const config = {
   selfName: getSelfName(),
   defaultHeadless: getDefaultHeadless(),
   activitySchedulerEnabled: getActivitySchedulerEnabled(),
-  activityTimes: getActivityTimes()
+  activityTimes: getActivityTimes(),
+  mediaDir: getMediaDir()
 };

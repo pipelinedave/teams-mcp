@@ -26,6 +26,12 @@ und Nachrichten senden – jeweils in einem isolierten Browser-Profil pro Konto/
 - **Dateianhänge unterstützen**: `teams_send_message` akzeptiert optionale lokale Dateipfade
   (`attachments: ["/tmp/file.zip"]` oder `attachment: "/tmp/file.zip"`). Automatischer Upload via
   FileChooser / Input-Bridge inklusive Upload-Fortschritts-Überwachung vor dem Versand.
+- **Inline-Bilder persistieren**: `teams_get_messages` löst flüchtige `blob:`-Screenshot-/Bild-URLs
+  direkt im Browser auf und speichert sie als Dateien nach `~/.teams-media/` (per
+  `TEAMS_MCP_MEDIA_DIR` änderbar). Dateiname: `{tenant}_{chat}_{timestamp}_{index}.{ext}`. Im
+  Markdown erscheint statt der unbrauchbaren `blob:`-URL ein lokaler `file://`-Pfad, den
+  multimodale Agenten direkt laden können. Flüchtige UI-Icons (Buttons/Avatare/Reaktionen)
+  werden dabei bewusst ignoriert.
 - **Konsistente Chat- & Adressbuch-Auflösung**: `chat_index` und `chat_name` lösen auf
   bestehende Chats auf. Ist ein Kollege noch nicht in der Chat-Liste, startet `teams_send_message`
   vollautomatisch einen neuen Chat über das globale Unternehmensadressbuch (GAL / People-Picker).
@@ -68,6 +74,7 @@ verwendet wird (z.B. `tenant: "deine-org.onmicrosoft.com"`).
 | `TEAMS_MCP_TENANT_REALMS` | JSON-Objekt `{ "key": "realm" }` zur Abbildung von Kurznamen auf Realm | – (tenant = realm) |
 | `TEAMS_MCP_SELF_NAME` | Eigener Anzeigename für „Ich“-Nachrichten | `"Ich"` |
 | `TEAMS_MCP_HEADLESS` | Headless-Default (`true`/`false`) | `true` |
+| `TEAMS_MCP_MEDIA_DIR` | Zielverzeichnis für persistierte inline-Bilder/Screenshots aus Nachrichten | `~/.teams-media` |
 
 ### Beispiele
 
