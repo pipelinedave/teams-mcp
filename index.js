@@ -10,7 +10,7 @@ import { browserManager } from './src/browserManager.js';
 import { teamsClient } from './src/teamsClient.js';
 import { config } from './src/config.js';
 import { ActivityReportScheduler, DEFAULT_SCHEDULE, runSchedulerControl } from './src/activityReportScheduler.js';
-import { createOutboxSender, listPendingDeliveries, markDelivered } from './src/reportDelivery.js';
+import { createOutboxSender, listPendingDeliveriesControl, markDeliveredControl } from './src/reportDelivery.js';
 
 // Singleton-Scheduler für den MCP-Server-Prozess: start/stop/status/run-once
 // greifen auf dieselbe Instanz zu, sodass die proaktive 2x/Tag-Pipeline zentral
@@ -512,35 +512,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'teams_list_pending_deliveries': {
-        const pending = listPendingDeliveries({ includeDelivered: !!args?.include_delivered });
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify({
-              count: pending.length,
-              deliveries: pending.map(({ file, delivery }) => ({
-                file,
-                kind: delivery.kind,
-                recipient: delivery.recipient,
-                tenant: delivery.tenant,
-                date: delivery.date,
-                createdAt: delivery.createdAt,
-                counts: delivery.counts,
-                delivered: delivery.delivered,
-                report: delivery.report
-              }))
-            }, null, 2)
-          }]
-        };
+        // Delegiert an die pure Steuerlogik listPendingDeliveriesControl (reportDelivery.js).
+        const result = listPendingDeliveriesControl({ includeDelivered: !!args?.include_delivered });
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
       case 'teams_mark_delivered': {
-        const file = args?.file;
-        if (!file) {
-          return { content: [{ type: 'text', text: JSON.stringify({ error: 'file ist erforderlich (Pfad aus teams_list_pending_deliveries)' }, null, 2) }] };
-        }
-        const res = markDelivered(file);
-        return { content: [{ type: 'text', text: JSON.stringify({ delivered: res.delivered, file: res.file }, null, 2) }] };
+        // Delegiert an die pure Steuerlogik markDeliveredControl (reportDelivery.js).
+        const res = markDeliveredControl(args?.file);
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       }
 
       case 'teams_close': {

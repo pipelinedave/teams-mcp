@@ -104,7 +104,10 @@ export class ActivityClient {
    * Seite (kein Zugriff auf Modul-Scope nötig).
    */
   async extractFeed(page, maxItems) {
-    return page.evaluate(({ max }) => extractActivityFromDom(document, { max }), { max: maxItems });
+    return page.evaluate(({ fnStr, max }) => {
+      const fn = new Function('return (' + fnStr + ')')();
+      return fn(document, { max });
+    }, { fnStr: extractActivityFromDom.toString(), max: maxItems });
   }
 
   /**

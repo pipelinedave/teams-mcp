@@ -131,3 +131,48 @@ export function markDelivered(file) {
   fs.renameSync(file, deliveredFile);
   return { delivered: true, file: deliveredFile };
 }
+
+/**
+ * Zentrale Steuerungslogik für die Outbox-Zustellung (MCP-Tool teams_list_pending_deliveries).
+ *
+ * Als pure, exportierte Funktion gebaut, damit sie in Unit-Tests ohne MCP-Kanal prüfbar
+ * ist. Der index.js-Handler ruft sie nur noch auf und verpackt das Ergebnis in eine
+ * MCP-Text-Antwort.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.includeDelivered] - auch bereits übergebene Nachrichten? (Standard false)
+ * @param {string}   [opts.dir] - Basis-Verzeichnis (Standard CWD)
+ * @returns {{count: number, deliveries: Array<object>}} serialisierbares Ergebnis
+ */
+export function listPendingDeliveriesControl({ includeDelivered = false, dir = process.cwd() } = {}) {
+  const pending = listPendingDeliveries({ dir, includeDelivered });
+  return {
+    count: pending.length,
+    deliveries: pending.map(({ file, delivery }) => ({
+      file,
+      kind: delivery.kind,
+      recipient: delivery.recipient,
+      tenant: delivery.tenant,
+      date: delivery.date,
+      createdAt: delivery.createdAt,
+      counts: delivery.counts,
+      delivered: delivery.delivered,
+      report: delivery.report
+    }))
+  };
+}
+
+/**
+ * Zentrale Steuerungslogik für teams_mark_delivered. Pure Funktion: nimmt den Dateipfad,
+ * markiert die Zustellung als übergeben und liefert ein serialisierbares Ergebnis.
+ * Fehlt der Pfad, wird ein Fehlerobjekt zurückgegeben — der MCP-Kanal bleibt stabil.
+ *
+ * @param {string} [file] - voller Pfad einer Outbox-Datei
+ * @returns {{delivered?: boolean, file?: string, error?: string}}
+ */
+export function markDeliveredControl(file) {
+  if (!file) {
+    return { error: 'file ist erforderlich (Pfad aus teams_list_pending_deliveries)' };
+  }
+  return markDelivered(file);
+}
