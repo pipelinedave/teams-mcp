@@ -880,10 +880,25 @@ export class TeamsClient {
         }
       }
 
+      const fileCards = Array.from(document.querySelectorAll('[data-tid*="attachment"], [class*="Attachment"], [class*="file-card"], a[href], [role="button"]')).map(el => ({
+        tag: el.tagName,
+        text: el.innerText ? el.innerText.trim().slice(0, 200) : "",
+        href: el.getAttribute("href"),
+        ariaLabel: el.getAttribute("aria-label"),
+        dataTid: el.getAttribute("data-tid"),
+        className: el.className ? String(el.className) : ""
+      })).filter(c => (c.text && c.text.includes("xlsx")) || (c.href && c.href.includes("xlsx")) || (c.ariaLabel && c.ariaLabel.includes("xlsx")));
+
+      const lastMsg = document.querySelectorAll('[data-tid="chat-pane-message"], .fui-ChatMessage__body, .fui-ChatMyMessage__body');
+      const lastMsgEl = lastMsg.length > 0 ? lastMsg[lastMsg.length - 1] : null;
+      const lastMsgHtml = lastMsgEl ? lastMsgEl.innerHTML : null;
+
       return {
         hasComposeFooter: !!composeFooter,
         fileInputs,
-        composeButtons: allButtons.slice(0, 30)
+        composeButtons: allButtons.slice(0, 30),
+        fileCards,
+        lastMsgHtml
       };
     });
 
