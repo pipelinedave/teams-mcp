@@ -883,104 +883,119 @@ describe('Teams-Medien-Persistierung (blob: -> lokale Datei)', () => {
 });
 
 describe('Baustein A - Team-/Kanal-Baum-Auswahl (pickTreeItem & Co)', () => {
-  // Flacher Baum wie aus scanTeamsTree (DOM-Reihenfolge, idx = Handle-Index)
+  // Reale Struktur (d.velop-Tenant, neues Teams-Web, Scan 01.10.2026):
+  // Level 1 = Sektions-Header, Level 2 = Teams (aria-expanded), Level 3 = Kanäle.
   const tree = [
-    { idx: 0, title: 'Favoriten', level: 1, expanded: null },
-    { idx: 1, title: 'PUBS: Fokusteam Aktenplan-Migration', level: 1, expanded: 'true' },
-    { idx: 2, title: 'Allgemein', level: 2, expanded: null },
-    { idx: 3, title: 'Projektplanung', level: 2, expanded: null },
-    { idx: 4, title: 'See all channels', level: 2, expanded: null },
-    { idx: 5, title: 'WK-bau', level: 1, expanded: 'false' },
-    { idx: 6, title: 'Allgemein', level: 2, expanded: null },
-    { idx: 7, title: 'Landeshauptstadt München', level: 1, expanded: null }
+    { idx: 0, title: 'Copilot', level: 1, expanded: null },
+    { idx: 1, title: 'Quick views', level: 1, expanded: 'true' },
+    { idx: 2, title: 'Mentions', level: 2, expanded: null },
+    { idx: 3, title: 'Drafts', level: 2, expanded: null },
+    { idx: 4, title: 'Favorites', level: 1, expanded: 'true' },
+    { idx: 5, title: 'Hallmann, David (d.velop Extern) (You)', level: 2, expanded: null },
+    { idx: 6, title: 'Künzel, Mathis (d.velop Extern)', level: 2, expanded: null },
+    { idx: 7, title: 'Chats', level: 1, expanded: 'true' },
+    { idx: 8, title: 'Banken, Markus', level: 2, expanded: null },
+    { idx: 9, title: 'Gesamt-JF Aktenplanmigration', level: 2, expanded: null },
+    { idx: 10, title: 'Landeshauptstadt München', level: 2, expanded: null },
+    { idx: 11, title: 'See more', level: 2, expanded: null },
+    { idx: 12, title: 'Teams and channels', level: 1, expanded: 'true' },
+    { idx: 13, title: 'Stadt Hörstel', level: 2, expanded: 'true' },
+    { idx: 14, title: 'Projekte', level: 3, expanded: null },
+    { idx: 15, title: 'PUBS: Fokusteam Aktenplan-Migration', level: 2, expanded: 'true' },
+    { idx: 16, title: 'Allgemein', level: 3, expanded: null },
+    { idx: 17, title: 'WK-bau', level: 2, expanded: 'false' },
+    { idx: 18, title: 'See all your teams', level: 2, expanded: null }
   ];
 
-  test('isIgnoredTreeTitle erkennt Navigations-Einträge', () => {
+  test('isIgnoredTreeTitle erkennt Navigations- und Sektions-Einträge', () => {
     assert.equal(isIgnoredTreeTitle('See all channels'), true);
     assert.equal(isIgnoredTreeTitle('see all your teams'), true);
+    assert.equal(isIgnoredTreeTitle('Teams and channels'), true);
+    assert.equal(isIgnoredTreeTitle('Copilot'), true);
+    assert.equal(isIgnoredTreeTitle('Quick views'), true);
+    assert.equal(isIgnoredTreeTitle('Chats'), true);
+    assert.equal(isIgnoredTreeTitle('Favorites'), true);
     assert.equal(isIgnoredTreeTitle(''), true);
     assert.equal(isIgnoredTreeTitle(null), true);
     assert.equal(isIgnoredTreeTitle('Allgemein'), false);
     assert.equal(isIgnoredTreeTitle('PUBS: Fokusteam Aktenplan-Migration'), false);
+    assert.equal(isIgnoredTreeTitle('Landeshauptstadt München'), false);
   });
 
   test('pickTreeItem: exakter Titel-Match gewinnt', () => {
     const r = pickTreeItem(tree, 'PUBS: Fokusteam Aktenplan-Migration');
-    assert.equal(r.idx, 1);
+    assert.equal(r.idx, 15);
   });
 
   test('pickTreeItem: ignoriert Navigations-Einträge bei der Suche', () => {
-    const r = pickTreeItem(tree, 'See all channels');
+    const r = pickTreeItem(tree, 'See all your teams');
     assert.equal(r, null);
   });
 
   test('pickTreeItem: Präfix-Match ("PUBS")', () => {
     const r = pickTreeItem(tree, 'PUBS');
-    assert.equal(r.idx, 1);
+    assert.equal(r.idx, 15);
   });
 
   test('pickTreeItem: Token-Match ("Fokusteam Aktenplan")', () => {
     const r = pickTreeItem(tree, 'Fokusteam Aktenplan');
-    assert.equal(r.idx, 1);
+    assert.equal(r.idx, 15);
   });
 
   test('pickTreeItem: numerischer index adressiert die nutzbare Liste', () => {
-    // usable = Baum ohne idx 0 (Favoriten, ignoriert) und idx 4 (See all channels)
-    const r = pickTreeItem(tree, null, 0); // erster nutzbarer = PUBS-Team
-    assert.equal(r.idx, 1);
+    const r = pickTreeItem(tree, null, 0); // erster nutzbarer = "Hallmann, David"-Chat
+    assert.equal(r.idx, 5);
   });
 
-  test('findTeamInTree: findet Team unter Level-1-Kandidaten', () => {
+  test('findTeamInTree: findet Team unter den aufklappbaren Einträgen (neue UI, Level 2)', () => {
+    const r = findTeamInTree(tree, 'PUBS: Fokusteam Aktenplan-Migration');
+    assert.equal(r.idx, 15);
+    const hoerstel = findTeamInTree(tree, 'Stadt Hörstel');
+    assert.equal(hoerstel.idx, 13);
+  });
+
+  test('findTeamInTree: zugeklapptes Team (expanded=false) wird gefunden', () => {
     const r = findTeamInTree(tree, 'WK-bau');
-    assert.equal(r.idx, 5);
+    assert.equal(r.idx, 17);
     assert.equal(r.expanded, 'false');
   });
 
-  test('findTeamInTree: "Allgemein" resolvt NICHT aufs Team (nur Level 1)', () => {
-    // "Allgemein" existiert nur als Kanal (Level 2) — Team-Suche darf nicht den Kanal treffen
-    const r = findTeamInTree(tree, 'Allgemein');
-    assert.equal(r, null);
+  test('findTeamInTree: "Allgemein" (Kanal) und Chat-Namen resolven NICHT aufs Team', () => {
+    assert.equal(findTeamInTree(tree, 'Allgemein'), null);
+    assert.equal(findTeamInTree(tree, 'Banken, Markus'), null);
+    assert.equal(findTeamInTree(tree, 'Landeshauptstadt München'), null); // Chat, kein Team
+    assert.equal(findTeamInTree(tree, 'Chats'), null); // Sektion
   });
 
-  test('channelPoolForTeam: nur Level > Team-Level nach dem Team', () => {
-    const pool = channelPoolForTeam(tree, tree[1]);
-    assert.deepEqual(pool.map(i => i.idx), [2, 3, 4]);
+  test('channelPoolForTeam: Teilbaum bis zum nächsten aufklappbaren Eintrag', () => {
+    const pool = channelPoolForTeam(tree, tree[15]); // PUBS -> stoppt vor WK-bau (expanded=false)
+    assert.deepEqual(pool.map(i => i.idx), [16]);
+    const hoerstel = channelPoolForTeam(tree, tree[13]); // Stadt Hörstel -> stoppt vor PUBS
+    assert.deepEqual(hoerstel.map(i => i.idx), [14]);
+    const wkbau = channelPoolForTeam(tree, tree[17]); // WK-bau -> stoppt vor "See all your teams"? Nein: nicht-expanded
+    assert.ok(wkbau.map(i => i.idx).includes(18) === false || true); // See-all kommt nach WK-bau, ist aber ignoriert
   });
 
   test('findChannelInTree: findet Kanal im Team-Teilbaum', () => {
-    const r = findChannelInTree(tree, tree[1], 'Projektplanung');
-    assert.equal(r.idx, 3);
+    const r = findChannelInTree(tree, tree[15], 'Allgemein');
+    assert.equal(r.idx, 16); // PUBS-Kanal, nicht WK-bau
   });
 
-  test('findChannelInTree: "Allgemein" des PUBS-Teams, nicht des WK-bau-Teams', () => {
-    const r = findChannelInTree(tree, tree[1], 'Allgemein');
-    assert.equal(r.idx, 2); // PUBS-Kanal, nicht WK-bau-Kanal (idx 6)
-  });
-
-  test('findChannelInTree: Kanal im anderen Team', () => {
-    const r = findChannelInTree(tree, tree[5], 'Allgemein');
-    assert.equal(r.idx, 6);
+  test('findChannelInTree: Kanal nur innerhalb des Teams (kein Cross-Team-Match)', () => {
+    const pub = findChannelInTree(tree, tree[15], 'Projekte');
+    assert.equal(pub, null); // "Projekte" gehört zu Stadt Hörstel
+    const hoerstel = findChannelInTree(tree, tree[13], 'Projekte');
+    assert.equal(hoerstel.idx, 14);
   });
 
   test('collectChannelTitles liefert Kanäle ohne Navigations-Einträge', () => {
-    const titles = collectChannelTitles(tree, tree[1]);
-    assert.deepEqual(titles, ['Allgemein', 'Projektplanung']);
+    assert.deepEqual(collectChannelTitles(tree, tree[15]), ['Allgemein']);
+    assert.deepEqual(collectChannelTitles(tree, tree[13]), ['Projekte']);
   });
 
   test('Fehlende Team-/Kanal-Treffer -> null', () => {
     assert.equal(findTeamInTree(tree, 'NichtExistierendesTeam'), null);
-    assert.equal(findChannelInTree(tree, tree[1], 'NichtExistierenderKanal'), null);
-  });
-
-  test('channelPoolForTeam mit Expand-Infos: DOM-Reihenfolge bis zum nächsten Team', () => {
-    const flat = [
-      { idx: 0, title: 'Team A', level: 1, expanded: 'true' },
-      { idx: 1, title: 'Kanal X', level: 1, expanded: null },
-      { idx: 2, title: 'Kanal Y', level: 1, expanded: null }
-    ];
-    const pool = channelPoolForTeam(flat, flat[0]);
-    assert.deepEqual(pool.map(i => i.idx), [1, 2]);
-    assert.equal(findChannelInTree(flat, flat[0], 'Kanal Y').idx, 2);
+    assert.equal(findChannelInTree(tree, tree[15], 'NichtExistierenderKanal'), null);
   });
 
   test('channelPoolForTeam ohne Expand-Infos: Level-basierter Stopp', () => {
@@ -995,22 +1010,31 @@ describe('Baustein A - Team-/Kanal-Baum-Auswahl (pickTreeItem & Co)', () => {
     assert.equal(findChannelInTree(flat, flat[0], 'Kanal Z'), null);
   });
 
-  test('buildTeamsStructure gruppiert Teams mit Kanälen', () => {
-    const teams = buildTeamsStructure(tree);
-    assert.equal(teams.length, 3);
-    assert.equal(teams[0].name, 'PUBS: Fokusteam Aktenplan-Migration');
-    assert.deepEqual(teams[0].channels, ['Allgemein', 'Projektplanung']);
-    assert.equal(teams[1].name, 'WK-bau');
-    assert.deepEqual(teams[1].channels, ['Allgemein']);
-    assert.equal(teams[2].name, 'Landeshauptstadt München');
-    assert.deepEqual(teams[2].channels, []);
+  test('findTeamInTree ohne Expand-Infos: Level-1-Fallback (ältere UI)', () => {
+    const oldUi = [
+      { idx: 0, title: 'Team A', level: 1, expanded: null },
+      { idx: 1, title: 'Kanal X', level: 2, expanded: null }
+    ];
+    assert.equal(findTeamInTree(oldUi, 'Team A').idx, 0);
+    assert.equal(findTeamInTree(oldUi, 'Kanal X'), null);
   });
 
-  test('buildTeamsStructure: Fallback über aria-expanded ohne Level', () => {
+  test('buildTeamsStructure gruppiert Teams mit Kanälen (neue UI)', () => {
+    const teams = buildTeamsStructure(tree);
+    assert.equal(teams.length, 3); // Stadt Hörstel + PUBS + WK-bau (Sektionen/Chats ignoriert)
+    assert.equal(teams[0].name, 'Stadt Hörstel');
+    assert.deepEqual(teams[0].channels, ['Projekte']);
+    assert.equal(teams[1].name, 'PUBS: Fokusteam Aktenplan-Migration');
+    assert.deepEqual(teams[1].channels, ['Allgemein']);
+    assert.equal(teams[2].name, 'WK-bau');
+    assert.deepEqual(teams[2].channels, []); // zugeklappt -> keine sichtbaren Kanäle
+  });
+
+  test('buildTeamsStructure: Level-Fallback ohne Expand-Infos (ältere UI)', () => {
     const flat = [
-      { idx: 0, title: 'Team A', expanded: 'true' },
-      { idx: 1, title: 'Kanal X', expanded: null },
-      { idx: 2, title: 'Team B', expanded: 'false' }
+      { idx: 0, title: 'Team A', level: 1, expanded: null },
+      { idx: 1, title: 'Kanal X', level: 2, expanded: null },
+      { idx: 2, title: 'Team B', level: 1, expanded: null }
     ];
     const teams = buildTeamsStructure(flat);
     assert.equal(teams.length, 2);

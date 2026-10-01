@@ -214,11 +214,16 @@ export class TeamsClient {
       const toIso = new Function('return (' + helpers.toIso + ')')();
       const collectAttachments = new Function('return (' + helpers.collectAttachments + ')')();
       const msgs = [];
-      const msgBodies = Array.from(document.querySelectorAll('[data-tid="chat-pane-message"], .fui-ChatMessage__body, .fui-ChatMyMessage__body'));
+      // Chat-DOM: chat-pane-message / fui-ChatMessage__body. Kanal-DOM (neues Teams-Web,
+      // Befund 01.10.2026): channel-pane-message-Rows mit message-body + post-message-subheader.
+      const msgBodies = Array.from(document.querySelectorAll('[data-tid="chat-pane-message"], [data-tid="message-body"], .fui-ChatMessage__body, .fui-ChatMyMessage__body'))
+        // Double-Counting verhindern: message-body innerhalb eines Chat-Message-Containers überspringen
+        .filter((el) => el.getAttribute('data-tid') !== 'message-body' ||
+          !el.closest('[data-tid="chat-pane-message"], .fui-ChatMessage, .fui-ChatMyMessage'));
       const slice = msgBodies.slice(-max);
 
       // Message-Container (Row) zu einem Body — Anhänge/Bilder können neben dem Text-Body liegen
-      const msgRowFor = (body) => body.closest('.fui-ChatMessage, .fui-ChatMyMessage, [role="listitem"], [role="group"]') || body;
+      const msgRowFor = (body) => body.closest('[data-tid="channel-pane-message"], .fui-ChatMessage, .fui-ChatMyMessage, [role="listitem"], [role="group"]') || body;
 
       for (const body of slice) {
         let author = '';
@@ -283,6 +288,31 @@ export class TeamsClient {
           }
         }
 
+        // Strategie 4 (Kanäle): Autor/Zeit aus post-message-subheader ("Messe, Adrian\n6/23 4:44 PM").
+        // Subheader liegt als Geschwister neben dem message-body — daher über die Row suchen.
+        const row = msgRowFor(body);
+        if (!author && row) {
+          const sub = row.querySelector('[data-tid="post-message-subheader"]');
+          if (sub) {
+            const lines = (sub.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
+            if (lines.length > 0) author = lines[0];
+          }
+        }
+        if (!timestamp && row) {
+          const rowTime = row.querySelector('time[datetime]');
+          if (rowTime) {
+            const iso = toIso(rowTime.getAttribute('datetime'));
+            if (iso) { timestamp = iso; timestampRaw = rowTime.getAttribute('datetime'); }
+          }
+          if (!timestamp) {
+            const sub = row.querySelector('[data-tid="post-message-subheader"]');
+            if (sub) {
+              const lines = (sub.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
+              if (lines.length > 1) timestampRaw = lines[lines.length - 1];
+            }
+          }
+        }
+
         msgs.push({
           author: author || 'Unbekannt',
           html: html,
@@ -290,7 +320,7 @@ export class TeamsClient {
           mid: mid || undefined,
           timestamp: timestamp || undefined,
           timestampRaw: timestampRaw || undefined,
-          attachments: collectAttachments(msgRowFor(body))
+          attachments: collectAttachments(row)
         });
       }
 
@@ -437,7 +467,7 @@ export class TeamsClient {
 
     // Aktiven Chat-Titel aus dem Message-Pane verifizieren (stabil)
     const activeChat = await this.getActiveChatTitle(page);
-    await page.waitForSelector('[data-tid="chat-pane-message"], .fui-ChatMessage__body, .fui-ChatMyMessage__body', { timeout: 15000 }).catch(() => null);
+    await page.waitForSelector('[data-tid="chat-pane-message"], [data-tid="message-body"], .fui-ChatMessage__body, .fui-ChatMyMessage__body', { timeout: 15000 }).catch(() => null);
 
     const messages = await this._scrapeMessages(page, {
       max: limit,
@@ -540,14 +570,28 @@ export class TeamsClient {
     };
   }
 
-  // Öffnet die Teams-Ansicht (App-Bar-Icon "Teams") und wartet auf den Team-/Kanal-Baum.
+  // Stellt sicher, dass die Team-/Kanal-Struktur sichtbar ist. Zwei UI-Varianten:
+  // (a) Neues Teams-Web: "Teams and channels"-Sektion in der Chat-Rail — ggf. aufklappen.
+  // (b) Ältere UI: eigenes App-Bar-Icon (data-tid="app-bar-teams") — darauf klicken.
   async openTeamsView(page) {
-    const teamsButton = await page.$('[data-tid="app-bar-teams"], button[aria-label*="Teams"], a[aria-label*="Teams"]');
+    const teamsButton = await page.$('[data-tid="app-bar-teams"], button[aria-label="Teams"], a[aria-label="Teams"]');
     if (teamsButton) {
       await teamsButton.click().catch(() => null);
       await page.waitForTimeout(2500);
     }
     await page.waitForSelector('[role="treeitem"]', { timeout: 15000 }).catch(() => null);
+
+    // Sektion "Teams and channels" ggf. aufklappen (sonst sind Teams/Kanäle nicht im Baum)
+    try {
+      const scan = await this.scanTeamsTree(page);
+      const section = scan.items.find(it =>
+        /^teams( and channels| und kanäle)?$/i.test(it.title || '') && it.expanded === 'false'
+      );
+      if (section && scan.handles[section.idx]) {
+        await scan.handles[section.idx].click().catch(() => null);
+        await page.waitForTimeout(2000);
+      }
+    } catch (e) { /* Baumscan nicht kritisch — openChannel scannt erneut */ }
   }
 
   // Scannt den Team-/Kanal-Baum der linken Rails. WICHTIG für die Index-Alignment:
@@ -655,14 +699,17 @@ export class TeamsClient {
     await page.waitForTimeout(2500);
 
     // Safety-Net: Verifizieren, dass der geöffnete Kanal dem Ziel entspricht.
+    // Befund 01.10.2026 (neues Teams-Web): Kanal-Header = [data-tid="channelTitle-text"],
+    // document.title = "(n) Chat | <Team> | <Kanal> | Microsoft Teams".
     const verify = await page.evaluate(() => {
       const selected = Array.from(document.querySelectorAll('[role="treeitem"][aria-selected="true"], [role="treeitem"][aria-current="true"]'))
         .map(el => (((el.innerText || '').split('\n')[0]) || '').trim())
         .filter(Boolean);
       const headerSels = [
+        '[data-tid="channelTitle-text"]',
+        '[data-tid="entity-header"]',
         '[data-tid="channel-title"]',
         '[data-tid="thread-pane-header"]',
-        '[data-tid="entity-header"] [role="heading"]',
         'header [aria-level]',
         '[data-tid="chat-title"]'
       ];
@@ -670,19 +717,22 @@ export class TeamsClient {
       for (const s of headerSels) {
         const el = document.querySelector(s);
         const t = el && el.innerText ? el.innerText.trim() : '';
-        if (t && t.length < 120) { header = t; break; }
+        if (t && t.length < 120) { header = t.split('\n')[0].trim() || t; break; }
       }
-      return { selected, header };
+      return { selected, header, title: document.title || '' };
     });
 
     const chanNorm = channelItem.title.toLowerCase().trim();
+    const teamNorm = teamFinal.title.toLowerCase().trim();
+    const titleNorm = (verify.title || '').toLowerCase();
     const headerMatch = !!verify.header && verify.header.toLowerCase().includes(chanNorm);
     const selectedMatch = (verify.selected || []).some(s => s.toLowerCase().trim() === chanNorm);
-    if (!headerMatch && !selectedMatch) {
-      throw new Error(`Sicherheitsnetz: Der geöffnete Kanal stimmt nicht mit dem Ziel überein. Ziel: '${channelItem.title}' (Team '${teamFinal.title}'), gefunden: Header='${verify.header || '(keiner)'}', selektiert=[${(verify.selected || []).join(', ') || '(keins)'}]. Es wurden KEINE Kanal-Nachrichten gelesen.`);
+    const titleMatch = titleNorm.includes(chanNorm) && titleNorm.includes(teamNorm);
+    if (!headerMatch && !selectedMatch && !titleMatch) {
+      throw new Error(`Sicherheitsnetz: Der geöffnete Kanal stimmt nicht mit dem Ziel überein. Ziel: '${channelItem.title}' (Team '${teamFinal.title}'), gefunden: Header='${verify.header || '(keiner)'}', Titel='${verify.title || '(keiner)'}', selektiert=[${(verify.selected || []).join(', ') || '(keins)'}]. Es wurden KEINE Kanal-Nachrichten gelesen.`);
     }
 
-    return { team: teamFinal.title, channel: channelItem.title, verify: { header: verify.header, selected: verify.selected } };
+    return { team: teamFinal.title, channel: channelItem.title, verify: { header: verify.header, title: verify.title, selected: verify.selected } };
   }
 
   async getChannelMessages(tenant = '', { team, channel = 'Allgemein', limit = 20, downloadAttachments = false, downloadLimit, downloadExtensions } = {}) {
@@ -694,7 +744,7 @@ export class TeamsClient {
 
     const nav = await this.openChannel(page, t, String(team).trim(), String(channel || 'Allgemein').trim());
 
-    await page.waitForSelector('[data-tid="chat-pane-message"], .fui-ChatMessage__body, .fui-ChatMyMessage__body', { timeout: 15000 }).catch(() => null);
+    await page.waitForSelector('[data-tid="channel-pane-message"], [data-tid="message-body"], [data-tid="chat-pane-message"], .fui-ChatMessage__body, .fui-ChatMyMessage__body', { timeout: 15000 }).catch(() => null);
 
     const messages = await this._scrapeMessages(page, {
       max: limit,
@@ -1445,12 +1495,18 @@ export function messageTimeToIso(raw) {
 }
 
 // Pseudo-Einträge im Team-/Kanal-Baum, die keine echten Teams/Kanäle sind
-// (Navigations- und Sammel-Einträge der linken Rails). Lowercase.
+// (Navigations- und Sektions-Header der linken Rails). Lowercase.
+// Befund 01.10.2026 (d.velop-Tenant, neues Teams-Web): Die Team-/Kanal-Struktur liegt
+// als Sektion "Teams and channels" INNERHALB der Chat-Rail — Level 1 = Sektions-Header
+// (Copilot, Quick views, Favorites, Chats, Teams and channels), Level 2 = Teams,
+// Level 3 = Kanäle. Ein data-tid="app-bar-teams" existiert dort NICHT mehr.
 export const TREE_IGNORED_TITLES = new Set([
   'see all channels', 'see all your teams', 'see more', 'manage teams', 'create a team',
   'your teams', 'hidden teams', 'communities', 'communities and storyline', 'favorites',
   'favoriten', 'alle kanäle anzeigen', 'alle teams anzeigen', 'mehr anzeigen',
-  'team erstellen', 'teams verwalten', 'meine teams', 'ausgeblendete teams'
+  'team erstellen', 'teams verwalten', 'meine teams', 'ausgeblendete teams',
+  'teams and channels', 'teams und kanäle', 'copilot', 'quick views', 'drafts',
+  'mentions', 'chats', 'activity', 'aktivität', 'calendar', 'kalender'
 ]);
 
 // Prüft, ob ein Baum-Titel ein Navigations-/Sammel-Entry statt echtem Team/Kanal ist.
@@ -1488,12 +1544,16 @@ export function pickTreeItem(items, name, index = null) {
   return null;
 }
 
-// Findet ein Team (Top-Level-Eintrag) im gescannten Baum. Bevorzugt Level-1-Einträge,
-// fällt auf alle Einträge zurück, wenn keine Levels vorliegen.
+// Findet ein Team im gescannten Baum. Teams sind aufklappbare Einträge (aria-expanded
+// gesetzt) — im neuen Teams-Web auf Level 2 unter der Sektion "Teams and channels",
+// in älteren UIs auf Level 1. Sektions-Header werden via isIgnoredTreeTitle ausgefiltert.
 export function findTeamInTree(items, teamName) {
-  const withLevel = (items || []).filter(it => Number.isFinite(it.level) && it.level === 1);
-  const pool = withLevel.length > 0 ? withLevel : (items || []);
-  return pickTreeItem(pool, teamName);
+  const list = items || [];
+  const expandable = list.filter(it => it.expanded != null && !isIgnoredTreeTitle(it.title));
+  if (expandable.length > 0) return pickTreeItem(expandable, teamName);
+  const level1 = list.filter(it => Number.isFinite(it.level) && it.level === 1);
+  if (level1.length > 0) return pickTreeItem(level1, teamName);
+  return pickTreeItem(list, teamName);
 }
 
 // Liefert die Kandidaten-Kanal-Einträge unterhalb eines Team-Eintrags (DOM-Reihenfolge).
@@ -1535,11 +1595,20 @@ export function collectChannelTitles(items, teamItem) {
 }
 
 // Gruppiert den flachen Baum in eine strukturierte Team->Kanäle-Ansicht.
-// Strategie 1: Level vorhanden -> Level 1 sind Teams, Rest Kanäle (DOM-Reihenfolge).
-// Strategie 2 (Fallback): Einträge mit aria-expanded sind Teams, Einträge dazwischen Kanäle.
+// Strategie 1 (neues Teams-Web): Teams = aufklappbare Einträge (aria-expanded gesetzt),
+// Kanäle = der Teilbaum darunter (bis zum nächsten aufklappbaren Eintrag).
+// Strategie 2 (Fallback, ältere UI): Level 1 sind Teams, Rest Kanäle (DOM-Reihenfolge).
 export function buildTeamsStructure(items) {
   const list = (items || []).filter(it => it && it.title && !isIgnoredTreeTitle(it.title));
   if (list.length === 0) return [];
+
+  const expandableTeams = list.filter(it => it.expanded != null);
+  if (expandableTeams.length > 0) {
+    return expandableTeams.map(team => ({
+      name: team.title,
+      channels: collectChannelTitles(items, team)
+    }));
+  }
 
   const hasLevel1 = list.some(it => Number.isFinite(it.level) && it.level === 1);
   const teams = [];
