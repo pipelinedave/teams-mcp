@@ -205,33 +205,20 @@ export class TeamsClient {
     return parts[0] || raw;
   }
 
-  async getMessages(tenant = '', { chatIndex, chatName, limit = 20 } = {}) {
-    const t = browserManager.normalizeTenant(tenant);
-    const page = await this.getPage(t, true);
-
-    const filtered = await this.getFilteredChatRows(page);
-
-    if (filtered.length === 0) {
-      throw new Error("Keine Chats in Teams gefunden.");
-    }
-
-    if (typeof chatIndex === 'number' || chatName) {
-      const picked = this.pickChatRow(filtered, chatName, chatIndex);
-      if (picked) {
-        await picked.row.click();
-        await page.waitForTimeout(2500);
-      }
-    }
-
-    // Aktiven Chat-Titel aus dem Message-Pane verifizieren (stabil)
-    const activeChat = await this.getActiveChatTitle(page);
-    await page.waitForSelector('[data-tid="chat-pane-message"], .fui-ChatMessage__body, .fui-ChatMyMessage__body', { timeout: 15000 }).catch(() => null);
-
-    const messagesData = await page.evaluate(async ({ max, selfName, helperStr, blobTimeoutMs }) => {
-      const toIso = new Function('return (' + helperStr + ')')();
+  // Gemeinsamer Message-Scraper für Chats UND Kanäle (Baustein A/B): extrahiert die
+  // im Message-Pane sichtbaren Nachrichten (Autor, Zeitstempel, Text, Medien, Anhänge).
+  // Die Blob-Medien werden im Browser zu dataURLs aufgelöst und anschließend in Node
+  // als Dateien persistiert. contextToken bestimmt den Dateinamen-Prefix der Medien.
+  async _scrapeMessages(page, { max = 20, tenant = '', contextToken = 'chat' } = {}) {
+    const messagesData = await page.evaluate(async ({ max, selfName, helpers, blobTimeoutMs }) => {
+      const toIso = new Function('return (' + helpers.toIso + ')')();
+      const collectAttachments = new Function('return (' + helpers.collectAttachments + ')')();
       const msgs = [];
       const msgBodies = Array.from(document.querySelectorAll('[data-tid="chat-pane-message"], .fui-ChatMessage__body, .fui-ChatMyMessage__body'));
       const slice = msgBodies.slice(-max);
+
+      // Message-Container (Row) zu einem Body — Anhänge/Bilder können neben dem Text-Body liegen
+      const msgRowFor = (body) => body.closest('.fui-ChatMessage, .fui-ChatMyMessage, [role="listitem"], [role="group"]') || body;
 
       for (const body of slice) {
         let author = '';
@@ -302,7 +289,8 @@ export class TeamsClient {
           text: text,
           mid: mid || undefined,
           timestamp: timestamp || undefined,
-          timestampRaw: timestampRaw || undefined
+          timestampRaw: timestampRaw || undefined,
+          attachments: collectAttachments(msgRowFor(body))
         });
       }
 
@@ -334,7 +322,6 @@ export class TeamsClient {
 
       // Je Nachricht die blob:-URLs aus dem gesamten Message-Container sammeln (Bilder können
       // als Attachment neben dem reinen Text-Body liegen). Reine UI-Icons werden ausgefiltert.
-      const msgRowFor = (body) => body.closest('.fui-ChatMessage, .fui-ChatMyMessage, [role="listitem"], [role="group"]') || body;
       const rowBlobUrls = msgs.map((m, i) => {
         const row = msgRowFor(slice[i]);
         if (!row) return [];
@@ -377,7 +364,7 @@ export class TeamsClient {
       } catch { /* Blob-Extraktion scheitert nie fatal: Nachrichten bleiben erhalten */ }
 
       return { msgs, blobData, rowBlobUrls };
-    }, { max: limit, selfName: config.selfName, helperStr: messageTimeToIso.toString(), blobTimeoutMs: 3000 });
+    }, { max, selfName: config.selfName, helpers: { toIso: messageTimeToIso.toString(), collectAttachments: collectAttachmentsFromRow.toString() }, blobTimeoutMs: 3000 });
 
     const { msgs, blobData, rowBlobUrls } = messagesData;
 
@@ -386,12 +373,12 @@ export class TeamsClient {
     const blobUrlToPath = {};
     const mediaDir = ensureMediaDir(config.mediaDir);
     if (blobData && typeof blobData === 'object') {
-      const chatToken = sanitizeFilename(activeChat || chatName || 'chat');
+      const chatToken = sanitizeFilename(contextToken || 'chat');
       const timeToken = Date.now();
       let index = 0;
       for (const [blobUrl, dataUrl] of Object.entries(blobData)) {
         if (!dataUrl) continue; // fehlgeschlagener Blob -> nicht blockieren
-        const filename = `${sanitizeFilename(t)}_${chatToken}_${timeToken}_${index}`;
+        const filename = `${sanitizeFilename(tenant)}_${chatToken}_${timeToken}_${index}`;
         const res = saveBlobDataUrl(dataUrl, mediaDir, filename);
         if (res.saved) {
           blobUrlToPath[blobUrl] = `file://${res.filePath}`;
@@ -412,25 +399,67 @@ export class TeamsClient {
       return lines.length ? `${content}\n\n${lines.join('\n')}` : content;
     };
 
+    return msgs.map((m, i) => {
+      const htmlWithMedia = replaceBlobUrlsInHtml(m.html, blobUrlToPath);
+      let content = turndown.turndown(htmlWithMedia || m.text);
+      content = appendRowMedia(i, content);
+      return {
+        author: m.author,
+        content,
+        mid: m.mid,
+        timestamp: m.timestamp,
+        timestampRaw: m.timestampRaw,
+        attachments: m.attachments || [],
+        mediaFiles: (rowBlobUrls && rowBlobUrls[i] || [])
+          .map((url) => blobUrlToPath[url])
+          .filter(Boolean)
+      };
+    });
+  }
+
+  async getMessages(tenant = '', { chatIndex, chatName, limit = 20, downloadAttachments = false, downloadLimit, downloadExtensions } = {}) {
+    const t = browserManager.normalizeTenant(tenant);
+    const page = await this.getPage(t, true);
+
+    const filtered = await this.getFilteredChatRows(page);
+
+    if (filtered.length === 0) {
+      throw new Error("Keine Chats in Teams gefunden.");
+    }
+
+    if (typeof chatIndex === 'number' || chatName) {
+      const picked = this.pickChatRow(filtered, chatName, chatIndex);
+      if (picked) {
+        await picked.row.click();
+        await page.waitForTimeout(2500);
+      }
+    }
+
+    // Aktiven Chat-Titel aus dem Message-Pane verifizieren (stabil)
+    const activeChat = await this.getActiveChatTitle(page);
+    await page.waitForSelector('[data-tid="chat-pane-message"], .fui-ChatMessage__body, .fui-ChatMyMessage__body', { timeout: 15000 }).catch(() => null);
+
+    const messages = await this._scrapeMessages(page, {
+      max: limit,
+      tenant: t,
+      contextToken: activeChat || chatName || 'chat'
+    });
+
+    let downloads = null;
+    if (downloadAttachments) {
+      downloads = await this.downloadMessageAttachments(page, {
+        limit: downloadLimit,
+        extensions: downloadExtensions,
+        token: t
+      });
+    }
+
     return {
       tenant: t,
       chat: activeChat,
-      count: msgs.length,
-      messages: msgs.map((m, i) => {
-        const htmlWithMedia = replaceBlobUrlsInHtml(m.html, blobUrlToPath);
-        let content = turndown.turndown(htmlWithMedia || m.text);
-        content = appendRowMedia(i, content);
-        return {
-          author: m.author,
-          content,
-          mid: m.mid,
-          timestamp: m.timestamp,
-          timestampRaw: m.timestampRaw,
-          mediaFiles: (rowBlobUrls && rowBlobUrls[i] || [])
-            .map((url) => blobUrlToPath[url])
-            .filter(Boolean)
-        };
-      })
+      count: messages.length,
+      messages,
+      ...(downloads ? { downloads } : {})
     };
   }
 
@@ -511,35 +540,336 @@ export class TeamsClient {
     };
   }
 
+  // Öffnet die Teams-Ansicht (App-Bar-Icon "Teams") und wartet auf den Team-/Kanal-Baum.
+  async openTeamsView(page) {
+    const teamsButton = await page.$('[data-tid="app-bar-teams"], button[aria-label*="Teams"], a[aria-label*="Teams"]');
+    if (teamsButton) {
+      await teamsButton.click().catch(() => null);
+      await page.waitForTimeout(2500);
+    }
+    await page.waitForSelector('[role="treeitem"]', { timeout: 15000 }).catch(() => null);
+  }
+
+  // Scannt den Team-/Kanal-Baum der linken Rails. WICHTIG für die Index-Alignment:
+  // items[] enthält ALLE Knoten (auch ohne Titel) in DOM-Reihenfolge — identisch zur
+  // ElementHandle-Liste von page.$$(SEL). Ein Klick erfolgt über items[i].idx auf
+  // handles[idx]. Level fällt auf die Tiefe verschachtelter Treeitem-Vorfahren zurück.
+  async scanTeamsTree(page) {
+    const SEL = '[role="treeitem"], [data-tid="team-channel-item"]';
+    const handles = await page.$$(SEL);
+    const items = await page.evaluate((sel) => {
+      const nodes = Array.from(document.querySelectorAll(sel));
+      return nodes.map((el) => {
+        const text = (el.innerText || '').replace(/\u00a0/g, ' ').trim();
+        let level = parseInt(el.getAttribute('aria-level') || '', 10);
+        if (!Number.isFinite(level)) {
+          // Fallback: Tiefe über verschachtelte Treeitem-Vorfahren schätzen
+          let depth = 1;
+          let anc = el.parentElement;
+          while (anc) {
+            if (anc.getAttribute && anc.getAttribute('role') === 'treeitem') depth++;
+            anc = anc.parentElement;
+          }
+          level = depth;
+        }
+        return {
+          title: text ? text.split('\n')[0].trim() : '',
+          level,
+          expanded: el.getAttribute('aria-expanded'),
+          selected: el.getAttribute('aria-selected') === 'true' || el.getAttribute('aria-current') === 'true',
+          tid: el.getAttribute('data-tid') || undefined
+        };
+      });
+    }, SEL);
+    const withIdx = items.map((it, idx) => ({ ...it, idx }));
+    return { handles, items: withIdx };
+  }
+
   async listTeams(tenant = '') {
     const t = browserManager.normalizeTenant(tenant);
     const page = await this.getPage(t, true);
 
-    const teamsButton = await page.$('[data-tid="app-bar-teams"], button[aria-label*="Teams"], a[aria-label*="Teams"]');
-    if (teamsButton) {
-      await teamsButton.click().catch(() => null);
-      await page.waitForTimeout(3000);
-    }
+    await this.openTeamsView(page);
+    const { items } = await this.scanTeamsTree(page);
 
-    const tree = await page.evaluate(() => {
-      const items = [];
-      const rows = document.querySelectorAll('div[role="treeitem"], [data-tid="team-channel-item"]');
-      for (const r of rows) {
-        const text = r.innerText?.trim();
-        if (text) {
-          items.push({
-            title: text.split('\n')[0],
-            level: r.getAttribute('aria-level') || '1'
-          });
-        }
-      }
-      return items;
-    });
+    const flat = items
+      .filter(it => it.title)
+      .map(it => ({ title: it.title, level: String(it.level) }));
+    const teams = buildTeamsStructure(items);
 
     return {
       tenant: t,
-      count: tree.length,
-      channels: tree
+      count: flat.length,
+      teams,
+      channels: flat
+    };
+  }
+
+  // Navigiert App-Bar -> Team -> Kanal und verifiziert das Ziel (Safety-Net analog
+  // zum Send-Flow): Liefert { team, channel, verify } oder wirft einen klaren Fehler
+  // mit den tatsächlich sichtbaren Einträgen (kein Silent-Fehlresolvenz wie chat_index).
+  async openChannel(page, tenant, teamName, channelName) {
+    await this.openTeamsView(page);
+    let scan = await this.scanTeamsTree(page);
+
+    const teamItem = findTeamInTree(scan.items, teamName);
+    if (!teamItem) {
+      const known = scan.items.filter(it => it.title && !isIgnoredTreeTitle(it.title)).map(it => it.title);
+      throw new Error(`Team '${teamName}' wurde im Teams-Baum (${tenant}) nicht gefunden. Sichtbare Einträge: ${known.slice(0, 25).join(' | ') || '(keine)'}`);
+    }
+
+    // Team anklicken (selektiert + expandiert die Kanalliste)
+    const teamHandle = scan.handles[teamItem.idx];
+    if (teamHandle) {
+      await teamHandle.scrollIntoViewIfNeeded?.().catch(() => {});
+      await teamHandle.click().catch(async () => {
+        await teamHandle.click({ force: true }).catch(() => null);
+      });
+      await page.waitForTimeout(2000);
+    }
+
+    // Falls das Team zugeklappt war, erneut scannen und ggf. expandieren
+    scan = await this.scanTeamsTree(page);
+    const teamItem2 = findTeamInTree(scan.items, teamName) || { ...teamItem, idx: scan.items.findIndex(it => it.title === teamItem.title) };
+    if (teamItem2 && teamItem2.expanded === 'false' && scan.handles[teamItem2.idx]) {
+      await scan.handles[teamItem2.idx].click().catch(() => null);
+      await page.waitForTimeout(2000);
+      scan = await this.scanTeamsTree(page);
+    }
+    const teamFinal = findTeamInTree(scan.items, teamName) || teamItem2;
+
+    const channelItem = findChannelInTree(scan.items, teamFinal, channelName);
+    if (!channelItem) {
+      const chans = collectChannelTitles(scan.items, teamFinal);
+      throw new Error(`Kanal '${channelName}' wurde im Team '${teamFinal.title}' (${tenant}) nicht gefunden. Verfügbare Kanäle: ${chans.join(' | ') || '(keine sichtbaren)'}`);
+    }
+
+    const channelHandle = scan.handles[channelItem.idx];
+    if (!channelHandle) {
+      throw new Error(`Kanal '${channelItem.title}' gefunden, aber kein klickbares Element im Baum (${tenant}).`);
+    }
+    await channelHandle.scrollIntoViewIfNeeded?.().catch(() => {});
+    await channelHandle.click().catch(async () => {
+      await channelHandle.click({ force: true }).catch(() => null);
+    });
+    await page.waitForTimeout(2500);
+
+    // Safety-Net: Verifizieren, dass der geöffnete Kanal dem Ziel entspricht.
+    const verify = await page.evaluate(() => {
+      const selected = Array.from(document.querySelectorAll('[role="treeitem"][aria-selected="true"], [role="treeitem"][aria-current="true"]'))
+        .map(el => (((el.innerText || '').split('\n')[0]) || '').trim())
+        .filter(Boolean);
+      const headerSels = [
+        '[data-tid="channel-title"]',
+        '[data-tid="thread-pane-header"]',
+        '[data-tid="entity-header"] [role="heading"]',
+        'header [aria-level]',
+        '[data-tid="chat-title"]'
+      ];
+      let header = null;
+      for (const s of headerSels) {
+        const el = document.querySelector(s);
+        const t = el && el.innerText ? el.innerText.trim() : '';
+        if (t && t.length < 120) { header = t; break; }
+      }
+      return { selected, header };
+    });
+
+    const chanNorm = channelItem.title.toLowerCase().trim();
+    const headerMatch = !!verify.header && verify.header.toLowerCase().includes(chanNorm);
+    const selectedMatch = (verify.selected || []).some(s => s.toLowerCase().trim() === chanNorm);
+    if (!headerMatch && !selectedMatch) {
+      throw new Error(`Sicherheitsnetz: Der geöffnete Kanal stimmt nicht mit dem Ziel überein. Ziel: '${channelItem.title}' (Team '${teamFinal.title}'), gefunden: Header='${verify.header || '(keiner)'}', selektiert=[${(verify.selected || []).join(', ') || '(keins)'}]. Es wurden KEINE Kanal-Nachrichten gelesen.`);
+    }
+
+    return { team: teamFinal.title, channel: channelItem.title, verify: { header: verify.header, selected: verify.selected } };
+  }
+
+  async getChannelMessages(tenant = '', { team, channel = 'Allgemein', limit = 20, downloadAttachments = false, downloadLimit, downloadExtensions } = {}) {
+    if (!team || !String(team).trim()) {
+      throw new Error("Team-Name (team_name) ist erforderlich, z.B. teams_get_channel_messages({ tenant: 'd-velop', team_name: 'Mein Team', channel_name: 'Allgemein' }).");
+    }
+    const t = browserManager.normalizeTenant(tenant);
+    const page = await this.getPage(t, true);
+
+    const nav = await this.openChannel(page, t, String(team).trim(), String(channel || 'Allgemein').trim());
+
+    await page.waitForSelector('[data-tid="chat-pane-message"], .fui-ChatMessage__body, .fui-ChatMyMessage__body', { timeout: 15000 }).catch(() => null);
+
+    const messages = await this._scrapeMessages(page, {
+      max: limit,
+      tenant: t,
+      contextToken: `${nav.team}_${nav.channel}`
+    });
+
+    let downloads = null;
+    if (downloadAttachments) {
+      downloads = await this.downloadMessageAttachments(page, {
+        limit: downloadLimit,
+        extensions: downloadExtensions,
+        token: t
+      });
+    }
+
+    return {
+      tenant: t,
+      team: nav.team,
+      channel: nav.channel,
+      verified: nav.verify,
+      count: messages.length,
+      messages,
+      ...(downloads ? { downloads } : {})
+    };
+  }
+
+  // Baustein B: Lädt Anhänge aus den sichtbaren Nachrichten als lokale Dateien herunter.
+  // Playwright-native Downloads (page.on('download') + saveAs) in config.downloadDir.
+  // Zwei Kaskaden: (1) Download-Buttons an Attachment-Karten, (2) dateiartige Links via
+  // Temp-Page mit ?download=1. Ein hängender Download wird nach timeoutMs übersprungen
+  // (Warnung in skipped[]) — das Scraping blockiert nie.
+  async downloadMessageAttachments(page, { limit = 5, extensions, timeoutMs = 25000, dir, token = 'teams' } = {}) {
+    const exts = normalizeExtensionWhitelist(extensions);
+    const downloadDir = ensureMediaDir(dir || config.downloadDir);
+    const result = { dir: downloadDir, attempted: 0, saved: [], skipped: [] };
+
+    const raceTimeout = (promise, label) => {
+      let timer;
+      const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Timeout nach ${timeoutMs}ms: ${label}`)), timeoutMs);
+      });
+      // No-op-Handler: Verhindert unhandled rejections, wenn die Gegenseite gewinnt
+      // (der MCP-Server-Prozess dürfte bei einer späten Rejection nicht crashen).
+      timeoutPromise.catch(() => {});
+      if (promise && typeof promise.catch === 'function') promise.catch(() => {});
+      return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+    };
+
+    // --- Kaskade 1: Download-Buttons an den Attachment-Karten ---
+    const buttonSelectors = [
+      '[data-tid*="attachment" i] button[aria-label*="erunterladen" i]',
+      '[data-tid*="attachment" i] button[aria-label*="ownload" i]',
+      '[data-tid*="attachment" i] button[title*="erunterladen" i]',
+      '[data-tid*="attachment" i] button[title*="ownload" i]',
+      '[role="listitem"] button[aria-label*="erunterladen" i]',
+      '[role="listitem"] button[aria-label*="ownload" i]',
+      '[role="group"] button[aria-label*="erunterladen" i]',
+      '[role="group"] button[aria-label*="ownload" i]',
+      'button[data-tid*="download" i]',
+      'button[data-tid*="attachment-download" i]'
+    ].join(', ');
+
+    let buttons = [];
+    try {
+      buttons = await page.$$(buttonSelectors);
+    } catch { buttons = []; }
+
+    for (const btn of buttons) {
+      if (result.saved.length >= limit) break;
+      // Dateiname aus dem Karten-Kontext (Button-Label selbst enthält meist nur "Herunterladen")
+      const cardName = await btn.evaluate((el) => {
+        const card = el.closest('[data-tid*="attachment" i], [class*="attachment" i], [role="listitem"], [role="group"]');
+        const label = (card && (card.getAttribute('aria-label') || card.innerText)) || '';
+        return (label + '').trim().split('\n')[0].trim();
+      }).catch(() => '');
+      const name = extractFilenameFromText(cardName) || extractFilenameFromText(cardName && cardName.replace(/[\\/]/g, ' '));
+      if (exts !== null && !name) {
+        result.skipped.push({ name: cardName || '(unbenannt)', reason: 'Kein Dateiname erkennbar (Extension-Whitelist aktiv)' });
+        continue;
+      }
+      if (exts !== null && !extensionAllowed(name, exts)) {
+        result.skipped.push({ name, reason: 'Endung nicht in Whitelist' });
+        continue;
+      }
+
+      result.attempted++;
+      try {
+        await btn.scrollIntoViewIfNeeded().catch(() => {});
+        await btn.hover().catch(() => {});
+        const downloadPromise = page.waitForEvent('download', { timeout: timeoutMs });
+        downloadPromise.catch(() => {}); // kein unhandled rejection bei Timeout/Klick-Fehler
+        await btn.click({ timeout: 5000 });
+        const download = await downloadPromise;
+        const saved = await raceTimeout(this._saveDownload(download, downloadDir, token), `saveAs(${name || 'anhang'})`);
+        result.saved.push(saved);
+      } catch (e) {
+        result.skipped.push({ name: name || cardName || '(unbenannt)', reason: `Download-Button fehlgeschlagen: ${String(e.message).slice(0, 120)}` });
+      }
+    }
+
+    // --- Kaskade 2: dateiartige Links (SharePoint) via Temp-Page mit &download=1 ---
+    if (result.saved.length < limit) {
+      let links = [];
+      try {
+        links = await page.evaluate(() => {
+          const NAME_RE = /([A-Za-z0-9\u00c0-\u024f][\w\u00c0-\u024f. ()[\]#&'`-]*\.[A-Za-z0-9]{2,5})(?=\s|$|\n)/;
+          const out = [];
+          const seen = new Set();
+          for (const a of document.querySelectorAll('[role="listitem"] a[href], [role="group"] a[href], [data-tid*="attachment" i] a[href]')) {
+            const href = a.getAttribute('href') || '';
+            if (!/^https?:\/\//i.test(href)) continue;
+            if (!/sharepoint|1drv|onedrive|personalcontent|download=1|\.pdf|\.docx?|\.xlsx?|\.pptx?|\.zip|\.txt|\.csv|\.png|\.jpe?g/i.test(href)) continue;
+            let bare = href;
+            try { bare = decodeURIComponent(href.split('?')[0]); } catch {}
+            const m = NAME_RE.exec((a.innerText || '').trim()) || NAME_RE.exec(bare);
+            const name = m ? m[1].trim() : null;
+            const key = name + '|' + href;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            out.push({ name, href });
+            if (out.length >= 20) break;
+          }
+          return out;
+        });
+      } catch { links = []; }
+
+      for (const link of links) {
+        if (result.saved.length >= limit) break;
+        if (exts !== null && !extensionAllowed(link.name || link.href, exts)) {
+          result.skipped.push({ name: link.name || link.href, reason: 'Endung nicht in Whitelist' });
+          continue;
+        }
+        result.attempted++;
+        let tmpPage = null;
+        try {
+          tmpPage = await page.context().newPage();
+          const downloadPromise = tmpPage.waitForEvent('download', { timeout: timeoutMs });
+          downloadPromise.catch(() => {}); // kein unhandled rejection bei Timeout
+          await tmpPage.goto(urlForcedDownload(link.href), { waitUntil: 'commit', timeout: timeoutMs }).catch(() => {});
+          const download = await downloadPromise.then(d => d, () => null);
+          if (!download) {
+            result.skipped.push({ name: link.name || link.href, reason: 'Kein Download ausgelöst (öffnete vermutlich den Office-Viewer)' });
+            continue;
+          }
+          const saved = await raceTimeout(this._saveDownload(download, downloadDir, token), `saveAs(${link.name || 'anhang'})`);
+          result.saved.push(saved);
+        } catch (e) {
+          result.skipped.push({ name: link.name || link.href, reason: `Link-Download fehlgeschlagen: ${String(e.message).slice(0, 120)}` });
+        } finally {
+          if (tmpPage) await tmpPage.close().catch(() => {});
+        }
+      }
+    }
+
+    if (result.saved.length === 0 && result.attempted === 0) {
+      result.note = 'Keine herunterladbaren Anhänge in den sichtbaren Nachrichten gefunden (Karten ohne Download-Button/Datei-Link).';
+    }
+    return result;
+  }
+
+  // Speichert einen Playwright-Download kollisionsfrei im Zielverzeichnis.
+  async _saveDownload(download, downloadDir, token = 'teams') {
+    let suggested = 'anhang';
+    try { suggested = download.suggestedFilename() || suggested; } catch {}
+    const target = nextAvailablePath(downloadDir, suggested);
+    await download.saveAs(target);
+    const size = fs.existsSync(target) ? fs.statSync(target).size : 0;
+    return {
+      name: path.basename(target),
+      suggestedName: suggested,
+      path: target,
+      file: `file://${target}`,
+      size,
+      token
     };
   }
 
@@ -1113,6 +1443,223 @@ export function messageTimeToIso(raw) {
   }
   return null;
 }
+
+// Pseudo-Einträge im Team-/Kanal-Baum, die keine echten Teams/Kanäle sind
+// (Navigations- und Sammel-Einträge der linken Rails). Lowercase.
+export const TREE_IGNORED_TITLES = new Set([
+  'see all channels', 'see all your teams', 'see more', 'manage teams', 'create a team',
+  'your teams', 'hidden teams', 'communities', 'communities and storyline', 'favorites',
+  'favoriten', 'alle kanäle anzeigen', 'alle teams anzeigen', 'mehr anzeigen',
+  'team erstellen', 'teams verwalten', 'meine teams', 'ausgeblendete teams'
+]);
+
+// Prüft, ob ein Baum-Titel ein Navigations-/Sammel-Entry statt echtem Team/Kanal ist.
+export function isIgnoredTreeTitle(title) {
+  const t = String(title || '').toLowerCase().trim();
+  if (!t) return true;
+  if (TREE_IGNORED_TITLES.has(t)) return true;
+  return t.startsWith('see ') || t.startsWith('alle kanäle') || t.startsWith('alle teams');
+}
+
+// Wählt ein Item aus einer Baum-Liste ({ title, idx?, level? }) — gleiche Match-Kaskade
+// wie pickChatRow: exakter Titel -> Präfix -> Token-Match. Ignorierte/leere Titel werden
+// übersprungen. Optionaler numerischer index adressiert die nutzbare Liste direkt.
+export function pickTreeItem(items, name, index = null) {
+  const usable = (items || []).filter(it => it && it.title && !isIgnoredTreeTitle(it.title));
+  if (typeof index === 'number' && index >= 0 && index < usable.length) return usable[index];
+  if (!name) return null;
+  const term = String(name).toLowerCase().trim();
+  if (!term) return null;
+
+  const exact = usable.find(it => it.title.toLowerCase() === term);
+  if (exact) return exact;
+
+  const prefix = usable.find(it => it.title.toLowerCase().startsWith(term));
+  if (prefix) return prefix;
+
+  const tokens = term.split(/\s+/).filter(Boolean);
+  if (tokens.length > 0) {
+    const tokenMatch = usable.find(it => {
+      const t = it.title.toLowerCase();
+      return tokens.every(tok => t.includes(tok));
+    });
+    if (tokenMatch) return tokenMatch;
+  }
+  return null;
+}
+
+// Findet ein Team (Top-Level-Eintrag) im gescannten Baum. Bevorzugt Level-1-Einträge,
+// fällt auf alle Einträge zurück, wenn keine Levels vorliegen.
+export function findTeamInTree(items, teamName) {
+  const withLevel = (items || []).filter(it => Number.isFinite(it.level) && it.level === 1);
+  const pool = withLevel.length > 0 ? withLevel : (items || []);
+  return pickTreeItem(pool, teamName);
+}
+
+// Liefert die Kandidaten-Kanal-Einträge unterhalb eines Team-Eintrags (DOM-Reihenfolge).
+// Stoppt am nächsten aufklappbaren Eintrag (aria-expanded = nächstes Team) bzw. — wenn
+// keine Expand-Infos vorliegen — am nächsten Eintrag mit level <= team.level. Ohne beide
+// Struktur-Infos: alle Einträge nach dem Team (DOM-Reihenfolge); das Safety-Net beim
+// Öffnen fängt Fehlklicks ab.
+export function channelPoolForTeam(items, teamItem) {
+  if (!teamItem) return [];
+  const list = items || [];
+  const hasExpandedInfo = list.some(it => it.expanded != null);
+  const pool = [];
+  for (const it of list) {
+    if (it.idx <= teamItem.idx) continue;
+    if (hasExpandedInfo) {
+      // Nächstes aufklappbares Element = nächstes Team -> Teilbaum zu Ende
+      if (it.expanded != null) break;
+      pool.push(it);
+    } else if (Number.isFinite(it.level) && Number.isFinite(teamItem.level)) {
+      if (it.level <= teamItem.level) break;
+      pool.push(it);
+    } else {
+      pool.push(it);
+    }
+  }
+  return pool;
+}
+
+// Findet einen Kanal innerhalb des Team-Teilbaums.
+export function findChannelInTree(items, teamItem, channelName) {
+  return pickTreeItem(channelPoolForTeam(items, teamItem), channelName);
+}
+
+// Kanaltitel eines Teams (für hilfreiche Fehlermeldungen).
+export function collectChannelTitles(items, teamItem) {
+  return channelPoolForTeam(items, teamItem)
+    .filter(it => it.title && !isIgnoredTreeTitle(it.title))
+    .map(it => it.title);
+}
+
+// Gruppiert den flachen Baum in eine strukturierte Team->Kanäle-Ansicht.
+// Strategie 1: Level vorhanden -> Level 1 sind Teams, Rest Kanäle (DOM-Reihenfolge).
+// Strategie 2 (Fallback): Einträge mit aria-expanded sind Teams, Einträge dazwischen Kanäle.
+export function buildTeamsStructure(items) {
+  const list = (items || []).filter(it => it && it.title && !isIgnoredTreeTitle(it.title));
+  if (list.length === 0) return [];
+
+  const hasLevel1 = list.some(it => Number.isFinite(it.level) && it.level === 1);
+  const teams = [];
+  let current = null;
+
+  for (const it of list) {
+    const isTeam = hasLevel1
+      ? (Number.isFinite(it.level) && it.level === 1)
+      : it.expanded != null;
+    if (isTeam) {
+      current = { name: it.title, channels: [] };
+      teams.push(current);
+    } else if (current) {
+      current.channels.push(it.title);
+    }
+  }
+  return teams;
+}
+
+// Extrahiert Dateianhang-Metadaten ({ name, href }) aus einer Message-Row.
+// Läuft serialisiert im Browser-Kontext (page.evaluate) und ist mit einem
+// minimalen DOM-Mock unit-testbar. Bewusst self-contained (keine Modul-Scope-Referenzen).
+export function collectAttachmentsFromRow(row) {
+  const out = [];
+  if (!row || typeof row.querySelectorAll !== 'function') return out;
+  const seen = new Set();
+  // Dateiname "name.ext" am Ende eines Labels / URL-Pfads
+  const NAME_RE = /([A-Za-z0-9\u00c0-\u024f][\w\u00c0-\u024f. ()[\]#&'`-]*\.[A-Za-z0-9]{2,5})(?=\s|$|\n)/;
+  const safeDecode = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
+  const push = (name, href) => {
+    if (!name) return;
+    const key = `${name}|${href || ''}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ name, href: href || null });
+  };
+
+  // 1) Links mit dateiartigem Ziel (SharePoint/OneDrive) oder dateiartigem Label
+  const links = row.querySelectorAll('a[href]') || [];
+  for (const a of links) {
+    const href = (a.getAttribute && a.getAttribute('href')) || '';
+    const label = (((a.getAttribute && a.getAttribute('aria-label')) || a.innerText || '') + '').trim();
+    const bare = safeDecode(String(href).split('?')[0]);
+    const m = NAME_RE.exec(label) || NAME_RE.exec(bare);
+    const fileish = /sharepoint|1drv|onedrive|personalcontent|download=1/i.test(href) || m;
+    if (!fileish) continue;
+    const name = m ? m[1].trim() : (label.split('\n')[0].trim() || null);
+    push(name, href);
+  }
+
+  // 2) Attachment-Cards (auch ohne <a>-Link: Download läuft über den Karten-Button)
+  const cardSel = '[data-tid*="attachment" i], [data-tid*="file-card" i], [class*="attachmentCard" i]';
+  const cards = row.querySelectorAll(cardSel) || [];
+  for (const card of cards) {
+    const label = (((card.getAttribute && card.getAttribute('aria-label')) || card.innerText || '') + '').trim();
+    const m = NAME_RE.exec(label);
+    if (m) push(m[1].trim(), null);
+  }
+  return out;
+}
+
+// Extrahiert einen "name.ext"-Dateinamen aus beliebigem Text (Karten-Label, Button-Kontext).
+export function extractFilenameFromText(text) {
+  const NAME_RE = /([A-Za-z0-9\u00c0-\u024f][\w\u00c0-\u024f. ()[\]#&'`-]*\.[A-Za-z0-9]{2,5})(?=\s|$|\n)/;
+  const m = NAME_RE.exec(String(text || ''));
+  return m ? m[1].trim() : null;
+}
+
+// Normalisiert eine Extension-Whitelist: Array kleinbuchstaben ohne führenden Punkt.
+// undefined/null -> Default-Whitelist; leeres Array -> null (= alle Endungen erlaubt).
+export function normalizeExtensionWhitelist(extensions) {
+  if (extensions === undefined || extensions === null) {
+    return [...DEFAULT_DOWNLOAD_EXTENSIONS];
+  }
+  let raw = extensions;
+  if (typeof raw === 'string') raw = raw.split(',');
+  if (!Array.isArray(raw)) return [...DEFAULT_DOWNLOAD_EXTENSIONS];
+  const cleaned = [...new Set(raw
+    .map(e => String(e || '').trim().toLowerCase().replace(/^\./, ''))
+    .filter(Boolean))];
+  return cleaned.length === 0 ? null : cleaned;
+}
+
+// Prüft anhand des Dateinamens gegen die Whitelist (null = alles erlaubt).
+export function extensionAllowed(filename, exts) {
+  if (exts === null || exts === undefined) return true;
+  const m = /\.([A-Za-z0-9]{1,10})$/.exec(String(filename || '').trim());
+  if (!m) return false;
+  return exts.includes(m[1].toLowerCase());
+}
+
+// Hängt ?download=1 bzw. &download=1 an eine Datei-URL an (SharePoint-Forced-Download),
+// sofern nicht bereits vorhanden.
+export function urlForcedDownload(href) {
+  const raw = String(href || '').trim();
+  if (!raw || !/^https?:\/\//i.test(raw)) return raw;
+  if (/([?&])download=1/i.test(raw)) return raw;
+  return raw + (raw.includes('?') ? '&' : '?') + 'download=1';
+}
+
+// Liefert einen kollisionsfreien absoluten Zielpfad im Download-Verzeichnis
+// (datei.ext, datei_1.ext, ... datei_999.ext, sonst Zeitstempel-Suffix).
+export function nextAvailablePath(dir, filename) {
+  const clean = sanitizeFilename(path.basename(String(filename || 'datei')), 80);
+  let candidate = path.join(dir, clean);
+  if (!fs.existsSync(candidate)) return candidate;
+  const ext = path.extname(clean);
+  const base = ext ? clean.slice(0, -ext.length) : clean;
+  for (let i = 1; i < 1000; i++) {
+    candidate = path.join(dir, `${base}_${i}${ext}`);
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+  return path.join(dir, `${base}_${Date.now()}${ext}`);
+}
+
+// Standard-Whitelist herunterladbarer Anhänge (Baustein B).
+export const DEFAULT_DOWNLOAD_EXTENSIONS = [
+  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'csv',
+  'zip', 'png', 'jpg', 'jpeg', 'gif', 'msg', 'vsdx', 'one', 'heic'
+];
 
 // Mime-Type -> Dateiendung für persistierte Teams-Medien (Fallback .bin).
 export function mimeToExt(mime) {

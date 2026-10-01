@@ -104,7 +104,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'teams_get_messages',
-        description: 'Liest die Nachrichtenverläufe eines Chats als Markdown aus (inkl. Autoren, Zeitstempel, Inhalt).',
+        description: 'Liest die Nachrichtenverläufe eines Chats als Markdown aus (inkl. Autoren, Zeitstempel, Inhalt, Anhang-Metadaten).',
         inputSchema: {
           type: 'object',
           properties: {
@@ -121,8 +121,61 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'number',
               description: 'Maximale Anzahl an Nachrichten (Standard: 20)',
               default: 20
+            },
+            download_attachments: {
+              type: 'boolean',
+              description: 'Anhänge der gelieferten Nachrichten als lokale Dateien herunterladen (Playwright-Download, Ziel: TEAMS_MCP_DOWNLOAD_DIR, Standard ~/.teams-downloads). Standard: false',
+              default: false
+            },
+            download_limit: {
+              type: 'number',
+              description: 'Maximale Anzahl Download-Versuche pro Aufruf (Standard: 5)'
+            },
+            download_extensions: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Whitelist zulässiger Dateiendungen ohne Punkt (z.B. ["pdf","pptx"]). Leere Liste = alle erlaubt. Standard: übliche Dokument-/Bildformate'
             }
           }
+        }
+      },
+      {
+        name: 'teams_get_channel_messages',
+        description: 'Liest Nachrichten aus einem TEAM-KANAL (nicht Chat!) als Markdown aus. Navigiert App-Bar -> Team -> Kanal und verifiziert den geöffneten Kanal (Safety-Net, kein Silent-Fehlresolvenz). Optional mit Attachment-Download.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tenant: tenantParam(),
+            team_name: {
+              type: 'string',
+              description: 'Name des Teams (z.B. "PUBS: Fokusteam Aktenplan-Migration")'
+            },
+            channel_name: {
+              type: 'string',
+              description: 'Kanalname im Team (z.B. "Allgemein"). Standard: "Allgemein"',
+              default: 'Allgemein'
+            },
+            limit: {
+              type: 'number',
+              description: 'Maximale Anzahl an Nachrichten (Standard: 20)',
+              default: 20
+            },
+            download_attachments: {
+              type: 'boolean',
+              description: 'Anhänge der gelieferten Nachrichten als lokale Dateien herunterladen (Playwright-Download, Ziel: TEAMS_MCP_DOWNLOAD_DIR, Standard ~/.teams-downloads). Standard: false',
+              default: false
+            },
+            download_limit: {
+              type: 'number',
+              description: 'Maximale Anzahl Download-Versuche pro Aufruf (Standard: 5)'
+            },
+            download_extensions: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Whitelist zulässiger Dateiendungen ohne Punkt (z.B. ["pdf","pptx"]). Leere Liste = alle erlaubt. Standard: übliche Dokument-/Bildformate'
+            }
+          },
+          required: ['team_name']
         }
       },
       {
@@ -147,7 +200,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'teams_list_teams',
-        description: 'Listet alle beigetretenen Microsoft Teams und deren Kanäle (Channels) auf.',
+        description: 'Listet alle beigetretenen Microsoft Teams und deren Kanäle auf. Liefert strukturiert teams: [{ name, channels: [...] }] sowie flach channels: [{ title, level }] — nutze die Namen für teams_get_channel_messages.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -400,7 +453,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await teamsClient.getMessages(tenant, {
           chatIndex: args?.chat_index,
           chatName: args?.chat_name,
-          limit: args?.limit || 20
+          limit: args?.limit || 20,
+          downloadAttachments: !!args?.download_attachments,
+          downloadLimit: args?.download_limit,
+          downloadExtensions: args?.download_extensions
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+        };
+      }
+
+      case 'teams_get_channel_messages': {
+        const tenant = resolveTenant(args?.tenant);
+        const result = await teamsClient.getChannelMessages(tenant, {
+          team: args?.team_name,
+          channel: args?.channel_name || 'Allgemein',
+          limit: args?.limit || 20,
+          downloadAttachments: !!args?.download_attachments,
+          downloadLimit: args?.download_limit,
+          downloadExtensions: args?.download_extensions
         });
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]

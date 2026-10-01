@@ -48,6 +48,8 @@ class BrowserManager {
     const opts = {
       viewport: { width: 1366, height: 850 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0',
+      // Baustein B: Playwright-native Downloads erlauben (Anhänge aus Nachrichten)
+      acceptDownloads: true,
       env: {
         ...process.env,
         DISPLAY: process.env.DISPLAY || ':0',

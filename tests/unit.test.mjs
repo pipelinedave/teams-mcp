@@ -10,7 +10,21 @@ import {
   sanitizeFilename,
   saveBlobDataUrl,
   replaceBlobUrlsInHtml,
-  ensureMediaDir
+  ensureMediaDir,
+  collectAttachmentsFromRow,
+  extractFilenameFromText,
+  normalizeExtensionWhitelist,
+  extensionAllowed,
+  urlForcedDownload,
+  nextAvailablePath,
+  pickTreeItem,
+  findTeamInTree,
+  findChannelInTree,
+  channelPoolForTeam,
+  collectChannelTitles,
+  buildTeamsStructure,
+  isIgnoredTreeTitle,
+  DEFAULT_DOWNLOAD_EXTENSIONS
 } from '../src/teamsClient.js';
 import { browserManager } from '../src/browserManager.js';
 import { cleanSpeakerName, aggregateEvents, isBotOrUiName } from '../src/speakerTracker.js';
@@ -865,5 +879,311 @@ describe('Teams-Medien-Persistierung (blob: -> lokale Datei)', () => {
     ensureMediaDir(nested);
     assert.ok(fs.existsSync(nested));
     assert.ok(fs.statSync(nested).isDirectory());
+  });
+});
+
+describe('Baustein A - Team-/Kanal-Baum-Auswahl (pickTreeItem & Co)', () => {
+  // Flacher Baum wie aus scanTeamsTree (DOM-Reihenfolge, idx = Handle-Index)
+  const tree = [
+    { idx: 0, title: 'Favoriten', level: 1, expanded: null },
+    { idx: 1, title: 'PUBS: Fokusteam Aktenplan-Migration', level: 1, expanded: 'true' },
+    { idx: 2, title: 'Allgemein', level: 2, expanded: null },
+    { idx: 3, title: 'Projektplanung', level: 2, expanded: null },
+    { idx: 4, title: 'See all channels', level: 2, expanded: null },
+    { idx: 5, title: 'WK-bau', level: 1, expanded: 'false' },
+    { idx: 6, title: 'Allgemein', level: 2, expanded: null },
+    { idx: 7, title: 'Landeshauptstadt München', level: 1, expanded: null }
+  ];
+
+  test('isIgnoredTreeTitle erkennt Navigations-Einträge', () => {
+    assert.equal(isIgnoredTreeTitle('See all channels'), true);
+    assert.equal(isIgnoredTreeTitle('see all your teams'), true);
+    assert.equal(isIgnoredTreeTitle(''), true);
+    assert.equal(isIgnoredTreeTitle(null), true);
+    assert.equal(isIgnoredTreeTitle('Allgemein'), false);
+    assert.equal(isIgnoredTreeTitle('PUBS: Fokusteam Aktenplan-Migration'), false);
+  });
+
+  test('pickTreeItem: exakter Titel-Match gewinnt', () => {
+    const r = pickTreeItem(tree, 'PUBS: Fokusteam Aktenplan-Migration');
+    assert.equal(r.idx, 1);
+  });
+
+  test('pickTreeItem: ignoriert Navigations-Einträge bei der Suche', () => {
+    const r = pickTreeItem(tree, 'See all channels');
+    assert.equal(r, null);
+  });
+
+  test('pickTreeItem: Präfix-Match ("PUBS")', () => {
+    const r = pickTreeItem(tree, 'PUBS');
+    assert.equal(r.idx, 1);
+  });
+
+  test('pickTreeItem: Token-Match ("Fokusteam Aktenplan")', () => {
+    const r = pickTreeItem(tree, 'Fokusteam Aktenplan');
+    assert.equal(r.idx, 1);
+  });
+
+  test('pickTreeItem: numerischer index adressiert die nutzbare Liste', () => {
+    // usable = Baum ohne idx 0 (Favoriten, ignoriert) und idx 4 (See all channels)
+    const r = pickTreeItem(tree, null, 0); // erster nutzbarer = PUBS-Team
+    assert.equal(r.idx, 1);
+  });
+
+  test('findTeamInTree: findet Team unter Level-1-Kandidaten', () => {
+    const r = findTeamInTree(tree, 'WK-bau');
+    assert.equal(r.idx, 5);
+    assert.equal(r.expanded, 'false');
+  });
+
+  test('findTeamInTree: "Allgemein" resolvt NICHT aufs Team (nur Level 1)', () => {
+    // "Allgemein" existiert nur als Kanal (Level 2) — Team-Suche darf nicht den Kanal treffen
+    const r = findTeamInTree(tree, 'Allgemein');
+    assert.equal(r, null);
+  });
+
+  test('channelPoolForTeam: nur Level > Team-Level nach dem Team', () => {
+    const pool = channelPoolForTeam(tree, tree[1]);
+    assert.deepEqual(pool.map(i => i.idx), [2, 3, 4]);
+  });
+
+  test('findChannelInTree: findet Kanal im Team-Teilbaum', () => {
+    const r = findChannelInTree(tree, tree[1], 'Projektplanung');
+    assert.equal(r.idx, 3);
+  });
+
+  test('findChannelInTree: "Allgemein" des PUBS-Teams, nicht des WK-bau-Teams', () => {
+    const r = findChannelInTree(tree, tree[1], 'Allgemein');
+    assert.equal(r.idx, 2); // PUBS-Kanal, nicht WK-bau-Kanal (idx 6)
+  });
+
+  test('findChannelInTree: Kanal im anderen Team', () => {
+    const r = findChannelInTree(tree, tree[5], 'Allgemein');
+    assert.equal(r.idx, 6);
+  });
+
+  test('collectChannelTitles liefert Kanäle ohne Navigations-Einträge', () => {
+    const titles = collectChannelTitles(tree, tree[1]);
+    assert.deepEqual(titles, ['Allgemein', 'Projektplanung']);
+  });
+
+  test('Fehlende Team-/Kanal-Treffer -> null', () => {
+    assert.equal(findTeamInTree(tree, 'NichtExistierendesTeam'), null);
+    assert.equal(findChannelInTree(tree, tree[1], 'NichtExistierenderKanal'), null);
+  });
+
+  test('channelPoolForTeam mit Expand-Infos: DOM-Reihenfolge bis zum nächsten Team', () => {
+    const flat = [
+      { idx: 0, title: 'Team A', level: 1, expanded: 'true' },
+      { idx: 1, title: 'Kanal X', level: 1, expanded: null },
+      { idx: 2, title: 'Kanal Y', level: 1, expanded: null }
+    ];
+    const pool = channelPoolForTeam(flat, flat[0]);
+    assert.deepEqual(pool.map(i => i.idx), [1, 2]);
+    assert.equal(findChannelInTree(flat, flat[0], 'Kanal Y').idx, 2);
+  });
+
+  test('channelPoolForTeam ohne Expand-Infos: Level-basierter Stopp', () => {
+    const flat = [
+      { idx: 0, title: 'Team A', level: 1, expanded: null },
+      { idx: 1, title: 'Kanal X', level: 2, expanded: null },
+      { idx: 2, title: 'Team B', level: 1, expanded: null },
+      { idx: 3, title: 'Kanal Z', level: 2, expanded: null }
+    ];
+    const pool = channelPoolForTeam(flat, flat[0]);
+    assert.deepEqual(pool.map(i => i.idx), [1]);
+    assert.equal(findChannelInTree(flat, flat[0], 'Kanal Z'), null);
+  });
+
+  test('buildTeamsStructure gruppiert Teams mit Kanälen', () => {
+    const teams = buildTeamsStructure(tree);
+    assert.equal(teams.length, 3);
+    assert.equal(teams[0].name, 'PUBS: Fokusteam Aktenplan-Migration');
+    assert.deepEqual(teams[0].channels, ['Allgemein', 'Projektplanung']);
+    assert.equal(teams[1].name, 'WK-bau');
+    assert.deepEqual(teams[1].channels, ['Allgemein']);
+    assert.equal(teams[2].name, 'Landeshauptstadt München');
+    assert.deepEqual(teams[2].channels, []);
+  });
+
+  test('buildTeamsStructure: Fallback über aria-expanded ohne Level', () => {
+    const flat = [
+      { idx: 0, title: 'Team A', expanded: 'true' },
+      { idx: 1, title: 'Kanal X', expanded: null },
+      { idx: 2, title: 'Team B', expanded: 'false' }
+    ];
+    const teams = buildTeamsStructure(flat);
+    assert.equal(teams.length, 2);
+    assert.deepEqual(teams[0], { name: 'Team A', channels: ['Kanal X'] });
+    assert.deepEqual(teams[1], { name: 'Team B', channels: [] });
+  });
+
+  test('buildTeamsStructure: leerer Baum -> leere Liste', () => {
+    assert.deepEqual(buildTeamsStructure([]), []);
+    assert.deepEqual(buildTeamsStructure(null), []);
+  });
+});
+
+describe('Baustein B - collectAttachmentsFromRow (Anhang-Metadaten)', () => {
+  function makeLinkEl({ href, label, text }) {
+    return {
+      getAttribute: (n) => {
+        if (n === 'href') return href;
+        if (n === 'aria-label') return label ?? null;
+        return null;
+      },
+      innerText: text ?? label ?? ''
+    };
+  }
+  function makeCardEl({ label, text }) {
+    return {
+      getAttribute: (n) => (n === 'aria-label' ? label ?? null : null),
+      innerText: text ?? label ?? ''
+    };
+  }
+  function makeRow({ links = [], cards = [] }) {
+    return {
+      closest: () => null,
+      querySelectorAll: (sel) => {
+        if (sel.startsWith('a[')) return links;
+        if (sel.includes('attachment') || sel.includes('file-card')) return cards;
+        return [];
+      }
+    };
+  }
+
+  test('extrahiert SharePoint-Link mit Dateinamen aus URL', () => {
+    const row = makeRow({
+      links: [makeLinkEl({ href: 'https://dvelop.sharepoint.com/:x:/r/sites/PUBS/Shared%20Documents/Allgemein/260929_Template_Kickoff_Aktenplanmigration.pptx?web=1' })]
+    });
+    const atts = collectAttachmentsFromRow(row);
+    assert.equal(atts.length, 1);
+    assert.equal(atts[0].name, '260929_Template_Kickoff_Aktenplanmigration.pptx');
+    assert.ok(atts[0].href.includes('sharepoint'));
+  });
+
+  test('extrahiert Dateinamen aus Link-Label (bevorzugt vor URL)', () => {
+    const row = makeRow({
+      links: [makeLinkEl({
+        href: 'https://contoso.sharepoint.com/:b:/r/sites/T/DocLib/a1b2c3?e=xyz',
+        label: 'Kickoff-Folien.pptx'
+      })]
+    });
+    const atts = collectAttachmentsFromRow(row);
+    assert.equal(atts.length, 1);
+    assert.equal(atts[0].name, 'Kickoff-Folien.pptx');
+  });
+
+  test('extrahiert Datei aus Attachment-Card ohne Link (href: null)', () => {
+    const row = makeRow({
+      cards: [makeCardEl({ label: '260929_Template_Kickoff_Aktenplanmigration.pptx\nPowerPoint-Präsentation' })]
+    });
+    const atts = collectAttachmentsFromRow(row);
+    assert.equal(atts.length, 1);
+    assert.equal(atts[0].name, '260929_Template_Kickoff_Aktenplanmigration.pptx');
+    assert.equal(atts[0].href, null);
+  });
+
+  test('ignoriert nicht-dateiartige Links (keine Extension, kein SharePoint)', () => {
+    const row = makeRow({
+      links: [makeLinkEl({ href: 'https://teams.microsoft.com/l/channel/xyz?groupId=abc', text: 'Zum Kanal' })]
+    });
+    assert.deepEqual(collectAttachmentsFromRow(row), []);
+  });
+
+  test('dedupliziert identische Anhänge (Card + Link)', () => {
+    const row = makeRow({
+      links: [makeLinkEl({ href: 'https://contoso.sharepoint.com/file.pdf', text: 'file.pdf' })],
+      cards: [makeCardEl({ label: 'file.pdf' })]
+    });
+    // Card (href: null) und Link (href gesetzt) sind verschiedene keys -> 2 Einträge,
+    // aber der Card-Eintrag ohne Link-Info dedupliziert NICHT gegen den Link-Eintrag.
+    const atts = collectAttachmentsFromRow(row);
+    assert.equal(atts.length, 2);
+    assert.ok(atts.some(a => a.href === null));
+    assert.ok(atts.some(a => a.href && a.href.includes('sharepoint')));
+  });
+
+  test('robust gegen null/leere Rows', () => {
+    assert.deepEqual(collectAttachmentsFromRow(null), []);
+    assert.deepEqual(collectAttachmentsFromRow({}), []);
+    assert.deepEqual(collectAttachmentsFromRow({ querySelectorAll: () => null }), []);
+  });
+});
+
+describe('Baustein B - Extension-Whitelist & Download-Helfer', () => {
+  test('normalizeExtensionWhitelist: Default bei undefined/null', () => {
+    assert.deepEqual(normalizeExtensionWhitelist(undefined), DEFAULT_DOWNLOAD_EXTENSIONS);
+    assert.deepEqual(normalizeExtensionWhitelist(null), DEFAULT_DOWNLOAD_EXTENSIONS);
+    assert.ok(DEFAULT_DOWNLOAD_EXTENSIONS.includes('pdf'));
+    assert.ok(DEFAULT_DOWNLOAD_EXTENSIONS.includes('pptx'));
+  });
+
+  test('normalizeExtensionWhitelist: normalisiert Punkte/Case, dedupliziert', () => {
+    assert.deepEqual(normalizeExtensionWhitelist(['.PDF', 'Docx', 'pdf']), ['pdf', 'docx']);
+  });
+
+  test('normalizeExtensionWhitelist: leere Liste -> null (= alle erlaubt)', () => {
+    assert.equal(normalizeExtensionWhitelist([]), null);
+  });
+
+  test('normalizeExtensionWhitelist: String mit Kommas wird akzeptiert', () => {
+    assert.deepEqual(normalizeExtensionWhitelist('pdf, .xlsx'), ['pdf', 'xlsx']);
+  });
+
+  test('extensionAllowed: Whitelist-Logik', () => {
+    const exts = ['pdf', 'pptx'];
+    assert.equal(extensionAllowed('folge.pptx', exts), true);
+    assert.equal(extensionAllowed('FOLGE.PPTX', exts), true);
+    assert.equal(extensionAllowed('virus.exe', exts), false);
+    assert.equal(extensionAllowed('ohne-endung', exts), false);
+    assert.equal(extensionAllowed(null, exts), false);
+  });
+
+  test('extensionAllowed: null = alles erlaubt', () => {
+    assert.equal(extensionAllowed('irgendwas.xyz', null), true);
+  });
+
+  test('urlForcedDownload hängt download=1 korrekt an', () => {
+    assert.equal(
+      urlForcedDownload('https://contoso.sharepoint.com/:x:/r/file.pptx?web=1'),
+      'https://contoso.sharepoint.com/:x:/r/file.pptx?web=1&download=1'
+    );
+    assert.equal(
+      urlForcedDownload('https://contoso.sharepoint.com/:x:/r/file.pptx'),
+      'https://contoso.sharepoint.com/:x:/r/file.pptx?download=1'
+    );
+    assert.equal(
+      urlForcedDownload('https://contoso.sharepoint.com/file.xlsx?download=1'),
+      'https://contoso.sharepoint.com/file.xlsx?download=1'
+    );
+  });
+
+  test('urlForcedDownload: nicht-http URLs unverändert', () => {
+    assert.equal(urlForcedDownload('blob:xyz'), 'blob:xyz');
+    assert.equal(urlForcedDownload(''), '');
+    assert.equal(urlForcedDownload(null), '');
+  });
+
+  test('extractFilenameFromText findet name.ext im Label-Rauschen', () => {
+    assert.equal(extractFilenameFromText('260929_Template_Kickoff_Aktenplanmigration.pptx'), '260929_Template_Kickoff_Aktenplanmigration.pptx');
+    assert.equal(extractFilenameFromText('Herunterladen\n260929_Template.pptx\nPowerPoint'), '260929_Template.pptx');
+    assert.equal(extractFilenameFromText('Herunterladen'), null);
+    assert.equal(extractFilenameFromText(''), null);
+    assert.equal(extractFilenameFromText(null), null);
+  });
+
+  test('nextAvailablePath liefert kollisionsfreie Pfade', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'teams-dl-'));
+    const first = nextAvailablePath(dir, 'folie.pptx');
+    assert.ok(first.endsWith('folie.pptx'));
+    fs.writeFileSync(first, 'x');
+    const second = nextAvailablePath(dir, 'folie.pptx');
+    assert.ok(second.endsWith('folie_1.pptx'));
+    assert.notEqual(first, second);
+    // Sonderzeichen werden sanitisiert
+    const weird = nextAvailablePath(dir, 'a/b:c*.pptx');
+    assert.ok(!weird.includes('/b:') || path.basename(weird).indexOf(':') === -1);
+    assert.ok(fs.existsSync(path.dirname(weird)));
   });
 });
