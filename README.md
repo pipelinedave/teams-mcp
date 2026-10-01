@@ -17,8 +17,23 @@ und Nachrichten senden – jeweils in einem isolierten Browser-Profil pro Konto/
 - **Multi-Tenant**: Jeder Tenant/Account bekommt ein isoliertes Browser-Profil
   (`.teams-browser-profile-<tenant>`) – keine Session-Kollisionen.
 - **Tools**: `teams_status`, `teams_login`, `teams_list_chats`, `teams_get_messages`,
-  `teams_search`, `teams_list_teams`, `teams_send_message`, `teams_inspect`, `teams_meeting_status`,
+  `teams_get_channel_messages`, `teams_search`, `teams_list_teams`, `teams_send_message`,
+  `teams_inspect`, `teams_meeting_status`,
   `teams_start_tracking`, `teams_stop_tracking`, `teams_close`.
+- **Kanal-Nachrichten lesen**: `teams_get_channel_messages` navigiert über den Team-/Kanal-Baum
+  (Sektion „Teams and channels“ der linken Rail) und liest Nachrichten aus Team-Kanälen —
+  inkl. Autor, Zeitstempel, Text (Markdown) und Anhänge-Metadaten. Parameter: `team_name`,
+  `channel_name` (Default „Allgemein“), `limit`. Ein Sicherheitsnetz verifiziert nach der
+  Navigation, dass der geöffnete Kanal dem Ziel entspricht (Header, `document.title`, Baum-
+  Selektion) — sonst klarer Fehler statt falscher Daten. `teams_list_teams` liefert dazu die
+  Team-/Kanal-Struktur (`teams: [{ name, channels: [...] }]`).
+- **Anhänge herunterladen**: `teams_get_messages` und `teams_get_channel_messages` akzeptieren
+  `download_attachments: true` (optional `download_limit`, `download_extensions` z.B.
+  `[".pptx", ".pdf"]` als Whitelist). Playwright-native Downloads (`page.on('download')` +
+  `saveAs`) landen in `~/.teams-downloads/` (per `TEAMS_MCP_DOWNLOAD_DIR` änderbar). Drei
+  Kaskaden: Attachment-Karten über das „More actions“-Menü, direkte Download-Buttons,
+  SharePoint-Links via Temp-Page mit `&download=1`. Ein hängender Download wird nach 25s
+  übersprungen (Warnung in `downloads.skipped[]`) — das Scraping blockiert nie.
 - **Aktivitätstab-Analyse**: `teams_get_activity` (Roh-Extraktion), `teams_analyze_activity`
   (Klassifikation), `teams_generate_activity_report` (täglicher Markdown-Report) und
   `teams_schedule_activity_report` (geplanter proaktiver Lauf 2x/Tag) – siehe Abschnitt
