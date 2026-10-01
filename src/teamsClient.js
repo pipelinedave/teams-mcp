@@ -794,7 +794,79 @@ export class TeamsClient {
       return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
     };
 
-    // --- Kaskade 1: Download-Buttons an den Attachment-Karten ---
+    // --- Kaskade 0: Attachment-Karten über "More actions" -> Menü "Download" ---
+    // Befund 01.10.2026: Karten (data-tid="file-attachment-grid") haben Hover-Buttons
+    // ("Copy link", "More actions"); das Menü enthält den Download-Eintrag. Direkte
+    // SharePoint-Links (:p:/r/) öffnen dagegen den Office-Viewer — kein Download-Event.
+    let cardHandles = [];
+    try {
+      cardHandles = await page.$$('[data-tid="file-attachment-grid"], [data-tid*="attachment-card" i], [data-tid*="file-card" i]');
+    } catch { cardHandles = []; }
+
+    for (const card of cardHandles) {
+      if (result.saved.length >= limit) break;
+      const cardName = await card.evaluate((el) => ((el.innerText || '').split('\n')[0] || '').trim()).catch(() => '');
+      if (exts !== null && !extensionAllowed(cardName, exts)) {
+        if (cardName) result.skipped.push({ name: cardName, reason: 'Endung nicht in Whitelist' });
+        continue;
+      }
+      if (!cardName) continue;
+
+      result.attempted++;
+      try {
+        await card.scrollIntoViewIfNeeded().catch(() => {});
+        await card.hover().catch(() => {});
+        await page.waitForTimeout(400);
+
+        // More-Actions-/Download-Button innerhalb der Karte (erscheint teils erst beim Hover)
+        const actionBtn = await card.$([
+          'button[aria-label*="more actions" i]',
+          'button[aria-label*="weitere aktionen" i]',
+          'button[aria-label*="mehr aktionen" i]',
+          'button[aria-label*="herunterladen" i]',
+          'button[aria-label*="download" i]',
+          'button[title*="ownload" i]'
+        ].join(', '));
+        if (!actionBtn) {
+          result.skipped.push({ name: cardName, reason: 'Kein More-Actions-/Download-Button in der Karte sichtbar' });
+          continue;
+        }
+
+        const directPromise = page.waitForEvent('download', { timeout: timeoutMs });
+        directPromise.catch(() => {}); // kein unhandled rejection bei Timeout
+        await actionBtn.click({ timeout: 5000 });
+
+        // Menü-Eintrag "Herunterladen"/"Download" suchen (Playwright :has-text ist case-insensitive)
+        const menuItem = await page.waitForSelector(
+          '[role="menuitem"]:has-text("Herunterladen"), [role="menuitem"]:has-text("Download")',
+          { timeout: 4000 }
+        ).catch(() => null);
+
+        let download = null;
+        if (menuItem) {
+          const menuPromise = page.waitForEvent('download', { timeout: timeoutMs });
+          menuPromise.catch(() => {});
+          await menuItem.click({ timeout: 5000 });
+          download = await menuPromise.then(d => d, () => null);
+        } else {
+          // Kein Menü — evtl. direkter Download durch den Button-Klick (kurz abwarten)
+          download = await Promise.race([directPromise, new Promise(r => setTimeout(() => r(null), 2000))]);
+        }
+        await page.keyboard.press('Escape').catch(() => {});
+
+        if (!download) {
+          result.skipped.push({ name: cardName, reason: menuItem ? 'Download-Eintrag geklickt, aber kein Download ausgelöst' : 'Kein Download-Menüeintrag gefunden' });
+          continue;
+        }
+        const saved = await raceTimeout(this._saveDownload(download, downloadDir, token), `saveAs(${cardName})`);
+        result.saved.push(saved);
+      } catch (e) {
+        await page.keyboard.press('Escape').catch(() => {});
+        result.skipped.push({ name: cardName || '(unbenannt)', reason: `Karten-Download fehlgeschlagen: ${String(e.message).slice(0, 120)}` });
+      }
+    }
+
+    // --- Kaskade 1: direkte Download-Buttons in den sichtbaren Nachrichten ---
     const buttonSelectors = [
       '[data-tid*="attachment" i] button[aria-label*="erunterladen" i]',
       '[data-tid*="attachment" i] button[aria-label*="ownload" i]',
@@ -847,6 +919,8 @@ export class TeamsClient {
     }
 
     // --- Kaskade 2: dateiartige Links (SharePoint) via Temp-Page mit &download=1 ---
+    // Letzter Ausweg: :p:/r-Links öffnen meist den Office-Viewer (kein Download-Event);
+    // für direkte /download=1-URLs funktioniert dieser Weg.
     if (result.saved.length < limit) {
       let links = [];
       try {
