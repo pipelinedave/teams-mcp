@@ -1214,29 +1214,45 @@ describe('Baustein B - Extension-Whitelist & Download-Helfer', () => {
 });
 
 describe('Baustein D - collectReactionsFromRow (Message Reactions / Checkmarks)', () => {
-  // Minimaler DOM-Mock analog zu collectAttachmentsFromRow-Tests.
-  function makeEl({ ariaLabel, title, text, badgeText }) {
+  // DOM-Mock nachgebildet am LIVE-BEFUND vom 08.10.2026 (Tenants adesso + d-velop):
+  // <div class="fui-ChatMessage__reactions">
+  //   <div role="toolbar" data-tid="diverse-reaction-summary" aria-label="Reaction summary">
+  //     <button data-tid="diverse-reaction-pill-button"
+  //             aria-labelledby="message-heart-<mid>" aria-pressed="true|false"
+  //             class="... diverse-reaction-pill[-checked] ...">
+  //       <span data-tid="emoticon-renderer"><img alt="❤️" itemid="heart"></span>
+  //       <div id="message-heart-<mid>">N Heart reactions.</div>
+  //       <span class="fui-StyledText">N</span>   (nur ab count>1)
+  //     </button>
+  //     <button data-tid="add-reaction-picker-entry-point-button">  (Plus, KEINE Reaktion)
+  function makeImg({ alt, itemid }) {
+    return { getAttribute: (n) => (n === 'alt' ? alt : n === 'itemid' ? itemid : null) };
+  }
+  function makePill({ type, emoji, itemid, count, byMe = false, plural = null }) {
+    const mid = '1789463782694';
+    const id = `message-${type}-${mid}`;
+    const word = plural || `${type.charAt(0).toUpperCase()}${type.slice(1)}${count === 1 ? ' reaction' : ' reactions'}.`;
+    const innerText = count > 1 ? `${count} ${word}\n${count}` : `${count} ${word}`;
     return {
+      innerText,
       getAttribute: (n) => {
-        if (n === 'aria-label') return ariaLabel ?? null;
-        if (n === 'title') return title ?? null;
+        if (n === 'aria-labelledby') return id;
+        if (n === 'aria-pressed') return byMe ? 'true' : 'false';
+        if (n === 'class') return byMe
+          ? 'fui-Button fui-ToggleButton diverse-reaction-pill diverse-reaction-pill-checked ___x'
+          : 'fui-Button fui-ToggleButton diverse-reaction-pill ___y';
         return null;
       },
-      innerText: text ?? ariaLabel ?? '',
-      querySelector: (sel) => {
-        if (badgeText !== undefined && sel.includes('CounterBadge')) {
-          return { innerText: badgeText, getAttribute: () => null };
-        }
-        return null;
-      }
+      querySelector: (sel) => (sel.includes('img') ? makeImg({ alt: emoji, itemid }) : null),
+      parentElement: null
     };
   }
-  function makeRow({ containers = [], buttons = [] }) {
+  function makeRow({ pills = [], containers = [] }) {
     return {
       closest: () => null,
       querySelectorAll: (sel) => {
-        if (sel.includes('reaction')) return containers;
-        if (sel.includes('button') || sel.includes('[role="button"]')) return buttons;
+        if (sel.includes('diverse-reaction-pill-button')) return pills;
+        if (sel.includes('ChatMessage__reactions') || sel.includes('reaction')) return containers;
         return [];
       }
     };
@@ -1248,63 +1264,107 @@ describe('Baustein D - collectReactionsFromRow (Message Reactions / Checkmarks)'
     assert.deepEqual(collectReactionsFromRow({ querySelectorAll: () => null }), []);
   });
 
-  test('extrahiert Checkmark/Häkchen-Reaktion aus Reaktions-Container (Birgit-Freigabe-Fall)', () => {
-    const row = makeRow({
-      containers: [makeEl({
-        ariaLabel: 'Häkchen',
-        text: '✔ 1',
-        badgeText: '1'
-      })]
-    });
+  test('extrahiert Slug + Emoji + Count aus echtem Pill-Button (Herz)', () => {
+    const row = makeRow({ pills: [makePill({ type: 'heart', emoji: '❤️', itemid: 'heart', count: 1, byMe: true })] });
     const reactions = collectReactionsFromRow(row);
     assert.equal(reactions.length, 1);
-    assert.ok(reactions[0].reaction.includes('✔') || reactions[0].reaction.toLowerCase().includes('häkchen'));
+    assert.equal(reactions[0].type, 'heart');
+    assert.equal(reactions[0].emoji, '❤️');
     assert.equal(reactions[0].count, 1);
+    assert.equal(reactions[0].byMe, true);
   });
 
-  test('extrahiert mehrere Reaktionen mit Zählern (Daumen, Herz)', () => {
+  test('Slug bleibt sprachunabhaengig: itemid "yes" + Label "Like reaction."', () => {
+    const row = makeRow({ pills: [makePill({ type: 'yes', emoji: '👍', itemid: 'yes', count: 1, plural: 'Like reaction.' })] });
+    const r = collectReactionsFromRow(row);
+    assert.equal(r[0].type, 'yes');
+    assert.equal(r[0].emoji, '👍');
+    assert.equal(r[0].count, 1);
+  });
+
+  test('count > 1 wird korrekt geparst (kein CounterBadge im echten DOM!)', () => {
+    const row = makeRow({ pills: [makePill({ type: 'heart', emoji: '❤️', itemid: 'heart', count: 3, plural: 'Heart reactions.' })] });
+    const r = collectReactionsFromRow(row);
+    assert.equal(r[0].count, 3);
+    assert.equal(r[0].byMe, false);
+  });
+
+  test('mehrere Reaktionen einer Nachricht (Daumen + Herz + Cry)', () => {
+    const row = makeRow({
+      pills: [
+        makePill({ type: 'yes', emoji: '👍', itemid: 'yes', count: 1, plural: 'Like reaction.' }),
+        makePill({ type: 'heart', emoji: '❤️', itemid: 'heart', count: 2, plural: 'Heart reactions.' }),
+        makePill({ type: 'cry', emoji: '😢', itemid: 'cry', count: 1, plural: 'Crying reaction.' })
+      ]
+    });
+    const reactions = collectReactionsFromRow(row);
+    assert.equal(reactions.length, 3);
+    assert.deepEqual(reactions.map(r => r.type), ['yes', 'heart', 'cry']);
+    assert.equal(reactions.find(r => r.type === 'heart').count, 2);
+  });
+
+  test('dedupliziert mehrfach gefundene Pillen', () => {
+    const pill = makePill({ type: 'heart', emoji: '❤️', itemid: 'heart', count: 1 });
+    const row = makeRow({ pills: [pill, pill] });
+    assert.equal(collectReactionsFromRow(row).length, 1);
+  });
+
+  test('Fallback: Emoji-img in Reaktions-Container, Plus-Button wird ausgeschlossen', () => {
+    const plusImg = makeImg({ alt: '➕', itemid: null });
+    plusImg.parentElement = { getAttribute: (n) => (n === 'data-tid' ? 'add-reaction-picker-entry-point-icon' : null), parentElement: null };
+    const heartImg = makeImg({ alt: '❤️', itemid: 'heart' });
+    heartImg.parentElement = null;
     const container = {
-      getAttribute: () => null,
-      innerText: '',
-      querySelector: () => null,
-      querySelectorAll: (sel) => {
-        if (sel.includes('CounterBadge')) return [];
-        return [
-          makeEl({ ariaLabel: 'Gefällt mir', text: '👍 3', badgeText: '3' }),
-          makeEl({ ariaLabel: 'Herz', text: '❤ 2', badgeText: '2' })
-        ];
-      }
+      innerText: '2 Heart reactions. 2',
+      querySelectorAll: (sel) => (sel.includes('img') ? [plusImg, heartImg] : [])
     };
     const row = makeRow({ containers: [container] });
     const reactions = collectReactionsFromRow(row);
-    assert.equal(reactions.length, 2);
-    const like = reactions.find(r => r.reaction.includes('👍') || /gefällt/i.test(r.reaction));
-    const heart = reactions.find(r => r.reaction.includes('❤') || /herz/i.test(r.reaction));
-    assert.ok(like, 'Daumen/Gefällt-mir-Reaktion fehlt');
-    assert.ok(heart, 'Herz-Reaktion fehlt');
-    assert.equal(like.count, 3);
-    assert.equal(heart.count, 2);
-  });
-
-  test('findet Emoji-Buttons auch ohne expliziten Reaktions-Container', () => {
-    const row = makeRow({
-      buttons: [makeEl({ text: '👍 5' })]
-    });
-    const reactions = collectReactionsFromRow(row);
     assert.equal(reactions.length, 1);
-    assert.ok(reactions[0].reaction.includes('👍'));
-    assert.equal(reactions[0].count, 5);
+    assert.equal(reactions[0].emoji, '❤️');
+    assert.equal(reactions[0].type, 'heart');
+    assert.equal(reactions[0].count, 2);
   });
 
-  test('ignoriert Nicht-Reaktions-Buttons (Mehr-Aktionen) ohne Emoji', () => {
+  test('Custom-Emoji: ASCII-alt wird NICHT als Glyph ausgegeben, Slug vor ";"', () => {
     const row = makeRow({
-      buttons: [makeEl({ ariaLabel: 'More actions', text: '⋯' })]
+      pills: [{
+        innerText: '1 adesso-cody_hooray reaction.',
+        getAttribute: (n) => {
+          if (n === 'aria-labelledby') return 'message-adesso-cody_hooray;0-weu-d7-12247599cb74815f3c6eeabd4d28ebbb-1789463782694';
+          if (n === 'aria-pressed') return 'true';
+          if (n === 'class') return 'fui-Button diverse-reaction-pill-checked';
+          return null;
+        },
+        querySelector: (sel) => (sel.includes('img')
+          ? { getAttribute: (n) => (n === 'alt' ? 'adesso-cody_hooray' : n === 'itemid' ? 'adesso-cody_hooray;0-weu-d7-1' : null) }
+          : null),
+        parentElement: null
+      }]
     });
+    const r = collectReactionsFromRow(row);
+    assert.equal(r.length, 1);
+    assert.equal(r[0].type, 'adesso-cody_hooray');   // Slug bereinigt (kein ';' + kein Hash)
+    assert.equal(r[0].emoji, null);                 // ASCII-ID ist kein Glyph
+    assert.equal(r[0].custom, true);
+    assert.equal(r[0].byMe, true);
+    assert.equal(r[0].count, 1);
+  });
+
+  test('Standard-Reaktion ist custom=false und liefert ein Glyph', () => {
+    const row = makeRow({ pills: [makePill({ type: 'heart', emoji: '❤️', itemid: 'heart', count: 1 })] });
+    const r = collectReactionsFromRow(row);
+    assert.equal(r[0].custom, false);
+    assert.equal(r[0].emoji, '❤️');
+  });
+
+  test('Nachricht ohne Reaktionen -> leeres Array', () => {
+    const row = makeRow({});
     assert.deepEqual(collectReactionsFromRow(row), []);
   });
 
-  test('leerer Reaktions-Container -> leeres Array', () => {
-    const row = makeRow({ containers: [] });
+  test('Reaktion ohne Emoji/Slug wird verworfen (z.B. Plus-Button)', () => {
+    const row = makeRow({ pills: [{ innerText: '', getAttribute: () => null, querySelector: () => null }] });
     assert.deepEqual(collectReactionsFromRow(row), []);
   });
 });

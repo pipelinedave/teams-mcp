@@ -1747,96 +1747,141 @@ export function collectAttachmentsFromRow(row) {
   return out;
 }
 
-// Reaktionen / Reactions einer Nachricht (Checkmarks, Daumen, Herzen etc.) extrahieren.
-// Läuft serialisiert im Browser-Kontext (page.evaluate) und ist mit einem minimalen
+// Message-Reactions (Checkmark, Daumen, Herz, ...) einer Nachricht extrahieren.
+// Laeuft serialisiert im Browser-Kontext (page.evaluate) und ist mit einem minimalen
 // DOM-Mock unit-testbar — gleiches Muster wie collectAttachmentsFromRow.
 //
-// Teams-Web rendert Reaktionen als Buttons/Elemente am unteren Rand einer Message-Row,
-// typisch:
-//   - in einem Container wie [data-tid*="reaction"], [class*="reaction"], .fui-ChatMessage__reactions
-//   - mit einem aria-label/title (DE/EN, z.B. "Gefällt mir", "Herz", "Häkchen", "Checkmark")
-//     oder einem Emoji-Zeichen im Text (👍, ❤, ✔, 😄 …)
-//   - optional mit Zähler als fui-CounterBadge/Textzahl (Anzahl der Personen)
+// KERN BEFUND (Live-DOM-Analyse 08.10.2026, Tenant adesso + d-velop, Teams-Web):
+// Reaktionen stehen als eigenstaendige Controls NEBEN dem Text-Body in der Message-ROW
+// (Container .fui-ChatMessage__reactions) und tauchen daher NICHT in body.innerText auf —
+// nur ein Scan ueber die ROW findet sie. Reale Struktur (verifiziert):
 //
-// WICHTIG (Kern von Davids Bug 08.10.2026): Eine "Reaktion" AST ist ein eigenständiges
-// Element NEBEN dem Text-Body der Nachricht und taucht im body.innerText NICHT auf. Nur
-// ein relativer Scan über die Message-ROW (nicht den Body) findet sie.
+//   <div class="fui-ChatMessage__reactions">
+//     <div role="toolbar" data-tid="diverse-reaction-summary" aria-label="Reaction summary">
+//       <button data-tid="diverse-reaction-pill-button"
+//               aria-labelledby="message-heart-1790155757631"   <-- KEIN aria-label!
+//               aria-pressed="true"                             <-- eigene Reaktion
+//               class="... diverse-reaction-pill-checked ...">  <-- eigene Reaktion
+//         <span data-tid="emoticon-renderer">
+//           <img alt="&#10084;&#65039;" itemid="heart" itemtype=".../Emoji" src=".../emoticons/heart/...">
+//         </span>
+//         <div id="message-heart-1790155757631">2 Heart reactions.</div>
+//         <span class="fui-StyledText">2</span>                <-- nur ab count>1
+//       </button>
+//       <button data-tid="add-reaction-picker-entry-point-button">…  <-- PLUS-Button, KEINE Reaktion
+//
+// Daraus folgt die Extraktionslogik:
+//  - type   = Slug aus aria-labelledby ("message-<type>-<mid>") bzw. img[itemid].
+//            SPRACHUNABHAENGIG (Slug bleibt auch bei deutschem UI englisch: heart/yes/laugh/cry).
+//  - emoji  = img[alt], NUR wenn es ein echtes Emoji-Glyph ist (❤️ / 👍 / 😢).
+//            Bei Custom-Emoji liefert Teams stattdessen eine ID ("adesso-cody_hooray",
+//            ASCII) -> dann emoji=null und custom=true; der Slug steht dann in type.
+//  - count  = fuehrende Zahl im Label-Text ("2 Heart reactions." -> 2; ohne Zahl -> 1).
+//  - byMe   = aria-pressed="true" oder Klasse diverse-reaction-pill-checked.
+//  - label  = Original-Label fuer die Anzeige (lokalisiert, daher nur informativ).
+// Es wird bewusst KEINE Positiv-/Negativ-Whitelist angewendet: das freigaberelevante
+// Checkmark ist je nach Teams-Version/Region ein eigener Slug — die Entscheidung, ob eine
+// Reaktion eine Freigabe ist, trifft der aufrufende Agent anhand von type/emoji/count/byMe.
+// Kein CounterBadge existiert in dieser Struktur (Befund: count kommt NUR aus dem Label-Text).
 export function collectReactionsFromRow(row) {
   const out = [];
   if (!row || typeof row.querySelectorAll !== 'function') return out;
   const seen = new Set();
 
-  // Bekannte Reaktions-Begriffe (DE + EN) für aria-label/title/title-Text-Matching.
-  // "Häkchen"/"Checkmark" ist die formal relevante Freigabe-Reaktion (Birgit Eilers).
-  const LABEL_WORDS = [
-    'gefällt', 'like', 'herz', 'heart', 'liebe', 'love', 'lachen', 'laugh',
-    'applaus', 'applause', 'händeklatschen', 'clap', 'überrascht', 'surprise',
-    'traurig', 'sad', 'wütend', 'angry', 'daumen', 'thumb', 'hashtag',
-    'häkchen', 'check', 'haken', 'okay', 'na klar', 'thumbs', 'danke', 'thanks', 'gift'
-  ];
-  // Bekannte Reaktions-Emojis (als Unicode-Zeichen; Häkchen/Checkmark vorangestellt,
-  // da formal für Freigaben). Gängige Teams-Reaktionsset-Emojis.
-  const EMOJI_RE = /(✔|✓|🗸|✅|👍|👎|❤|💖|😀|😄|😂|😆|🤣|😮|😲|😢|😭|😡|👏|🙌|🎉|🥳|💯|❗|❓|🙏|🤝|⭐|❤️|🟢)/;
+  const clean = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
 
-  const push = (name, count) => {
-    const key = `${name}|${count}`;
+  const push = (rec) => {
+    if (!rec || (!rec.type && !rec.emoji)) return;
+    const key = `${rec.type}|${rec.emoji}`;
     if (seen.has(key)) return;
     seen.add(key);
-    out.push({ reaction: name, count });
+    out.push(rec);
   };
 
-  const cleanLabel = (raw) => {
-    // aus "Mein Text" bzw. aria-label wie "Gefällt mir (5)"/ "Häkchen" die Reaktion ableiten
-    const t = String(raw || '').trim();
-    if (!t) return '';
-    const m = EMOJI_RE.exec(t);
-    if (m) return m[1]; // Emoji direkt
-    return t;
+  // Sprachunabhaengiger Reaktions-Slug aus "message-heart-1790155757631".
+  // Bei Custom-Emoji ist die Id laenger und enthaelt ein ';':
+  //   message-adesso-cody_hooray;0-weu-d7-<hash>-<mid>  ->  "adesso-cody_hooray"
+  const typeFromLabelledby = (id) => {
+    const m = /^message-(.+)-\d{4,}$/.exec(clean(id));
+    if (!m) return null;
+    const t = m[1].split(';')[0].trim().toLowerCase();
+    return t || null;
   };
 
-  const countFrom = (el) => {
-    // Zähler: fui-CounterBadge oder sichtbare Zahl am Reaktions-Button
-    let cnt = null;
-    const badge = el.querySelector && el.querySelector('[class*="CounterBadge" i], [class*="counter" i], [data-tid*="count" i]');
-    if (badge) {
-      const n = Number.parseInt(String(badge.innerText || badge.getAttribute('aria-label') || '').replace(/\D/g, ''), 10);
-      if (Number.isFinite(n)) cnt = n;
-    }
-    if (cnt === null) {
-      const n = Number.parseInt(String(el.innerText || '').replace(/[^\d]/g, ''), 10);
-      if (Number.isFinite(n) && n > 0) cnt = n;
-    }
-    return cnt;
+  // Ist der alt-Wert ein echtes Emoji-Glyph oder nur eine Emoji-ID?
+  // Custom-Emoji liefern "adesso-cody_hooray" (ASCII) statt eines Zeichens.
+  const isGlyph = (s) => /[^\x20-\x7E]/.test(String(s || ''));
+
+  // Fuehrende Zahl im Label ("2 Heart reactions." -> 2). Ohne Zahl => 1.
+  const countFromLabel = (txt) => {
+    const m = /(\d+)/.exec(String(txt || ''));
+    const n = m ? Number(m[1]) : 1;
+    return Number.isFinite(n) && n > 0 ? n : 1;
   };
 
-  // Kandidaten sammeln: alle Reaktions-Container bzw. Buttons, die wie eine Reaktion aussehen.
-  const containers = row.querySelectorAll('[data-tid*="reaction" i], [class*="reaction" i], [class*="Reaction" i], [class*="Reactions" i]') || [];
+  // Emoji + itemid aus dem emoticon-renderer des Pill-Buttons.
+  // Custom-Emoji: alt ist die Emoji-ID (kein Glyph) -> emoji=null, custom=true.
+  const emojiFrom = (pill) => {
+    const img = pill.querySelector && pill.querySelector('img[alt]');
+    if (!img) return { emoji: null, itemType: null, custom: false };
+    const alt = clean(img.getAttribute('alt'));
+    const itemType = clean(img.getAttribute('itemid')) || null;
+    if (!alt) return { emoji: null, itemType, custom: false };
+    if (isGlyph(alt)) return { emoji: alt, itemType, custom: false };
+    return { emoji: null, itemType: alt, custom: true };
+  };
 
-  // 1) Direkte Kinder aus Reaktions-Containern (häufigste Struktur)
-  for (const c of containers) {
-    const children = (c.querySelectorAll && c.querySelectorAll('button, [role="button"], [role="img"]')) || [c];
-    for (const el of children) {
-      const label = String(((el.getAttribute && el.getAttribute('aria-label')) || (el.getAttribute && el.getAttribute('title')) || el.innerText || '') + '').trim();
-      const name = cleanLabel(label);
-      if (!name) continue;
-      const hook = String(((el.getAttribute && el.getAttribute('aria-label')) || (el.getAttribute && el.getAttribute('title')) || '') + '').toLowerCase();
-      const isLabelMatch = LABEL_WORDS.some(w => hook.includes(w));
-      if (!isLabelMatch && !EMOJI_RE.test(label)) continue;
-      push(name, countFrom(el));
-    }
+  // --- Strategie 1: reale Teams-Struktur (data-tid=diverse-reaction-pill-button) ---
+  const pills = row.querySelectorAll('[data-tid="diverse-reaction-pill-button"]') || [];
+  for (const pill of pills) {
+    const labelledby = pill.getAttribute('aria-labelledby') || '';
+    const { emoji, itemType, custom } = emojiFrom(pill);
+    const labelText = clean(pill.innerText);
+    const cls = String(pill.getAttribute('class') || '');
+    push({
+      type: typeFromLabelledby(labelledby) || (itemType || '').split(';')[0].toLowerCase() || null,
+      emoji: emoji || null,
+      custom: custom || false,
+      count: countFromLabel(labelText),
+      byMe: pill.getAttribute('aria-pressed') === 'true' || /reaction-pill-checked/.test(cls),
+      label: labelText || null
+    });
   }
+  if (out.length > 0) return out;
 
-  // 2) Falls keine Reaktions-Container existierten: Buttons der Row mit Emoji + CounterBadge
-  //    direkt scannen (robust gegen variierende data-tid-Namen).
-  if (out.length === 0) {
-    const buttons = row.querySelectorAll('button, [role="button"]') || [];
-    for (const b of buttons) {
-      const inner = String(b.innerText || '').trim();
-      if (!EMOJI_RE.test(inner)) continue;
-      const label = String(((b.getAttribute && b.getAttribute('aria-label')) || (b.getAttribute && b.getAttribute('title')) || inner) + '').trim();
-      const name = cleanLabel(label);
-      if (!name) continue;
-      push(name, countFrom(b));
+  // --- Strategie 2 (Fallback, aeltere/alternative Markup-Varianten): ---
+  // Emoji-Bilder (img[itemid][itemtype*=Emoji]) in Reaktions-Containern. Der
+  // Plus-Button (add-reaction-picker-entry-point-button) wird explizit ausgeschlossen.
+  const containers = row.querySelectorAll(
+    '[class*="reactionSummary" i], [class*="ChatMessage__reactions" i], [data-tid*="reaction-summary" i], [data-tid*="reactions-summary" i]'
+  ) || [];
+  const handled = new Set();
+  for (const c of containers) {
+    if (handled.has(c)) continue;
+    handled.add(c);
+    const contText = clean(c.innerText);
+    const imgs = Array.from(c.querySelectorAll('img[alt], img[itemid]')) || [];
+    for (const img of imgs) {
+      // Plus-/Picker-Button ist keine Reaktion
+      let cur = img.parentElement;
+      let inPicker = false;
+      while (cur && cur !== c) {
+        const tid = String((cur.getAttribute && cur.getAttribute('data-tid')) || '');
+        if (tid.includes('add-reaction-picker') || tid.includes('reaction-picker')) { inPicker = true; break; }
+        cur = cur.parentElement;
+      }
+      if (inPicker) continue;
+      const alt = clean(img.getAttribute('alt'));
+      if (!alt) continue;
+      const glyph = isGlyph(alt);
+      push({
+        type: (clean(img.getAttribute('itemid')) || alt).split(';')[0].toLowerCase() || null,
+        emoji: glyph ? alt : null,
+        custom: !glyph,
+        count: countFromLabel(contText),
+        byMe: false,
+        label: contText || null
+      });
     }
   }
 
