@@ -12,6 +12,7 @@ import {
   replaceBlobUrlsInHtml,
   ensureMediaDir,
   collectAttachmentsFromRow,
+  collectReactionsFromRow,
   extractFilenameFromText,
   normalizeExtensionWhitelist,
   extensionAllowed,
@@ -1209,5 +1210,101 @@ describe('Baustein B - Extension-Whitelist & Download-Helfer', () => {
     const weird = nextAvailablePath(dir, 'a/b:c*.pptx');
     assert.ok(!weird.includes('/b:') || path.basename(weird).indexOf(':') === -1);
     assert.ok(fs.existsSync(path.dirname(weird)));
+  });
+});
+
+describe('Baustein D - collectReactionsFromRow (Message Reactions / Checkmarks)', () => {
+  // Minimaler DOM-Mock analog zu collectAttachmentsFromRow-Tests.
+  function makeEl({ ariaLabel, title, text, badgeText }) {
+    return {
+      getAttribute: (n) => {
+        if (n === 'aria-label') return ariaLabel ?? null;
+        if (n === 'title') return title ?? null;
+        return null;
+      },
+      innerText: text ?? ariaLabel ?? '',
+      querySelector: (sel) => {
+        if (badgeText !== undefined && sel.includes('CounterBadge')) {
+          return { innerText: badgeText, getAttribute: () => null };
+        }
+        return null;
+      }
+    };
+  }
+  function makeRow({ containers = [], buttons = [] }) {
+    return {
+      closest: () => null,
+      querySelectorAll: (sel) => {
+        if (sel.includes('reaction')) return containers;
+        if (sel.includes('button') || sel.includes('[role="button"]')) return buttons;
+        return [];
+      }
+    };
+  }
+
+  test('robust gegen null/leere Rows', () => {
+    assert.deepEqual(collectReactionsFromRow(null), []);
+    assert.deepEqual(collectReactionsFromRow({}), []);
+    assert.deepEqual(collectReactionsFromRow({ querySelectorAll: () => null }), []);
+  });
+
+  test('extrahiert Checkmark/Häkchen-Reaktion aus Reaktions-Container (Birgit-Freigabe-Fall)', () => {
+    const row = makeRow({
+      containers: [makeEl({
+        ariaLabel: 'Häkchen',
+        text: '✔ 1',
+        badgeText: '1'
+      })]
+    });
+    const reactions = collectReactionsFromRow(row);
+    assert.equal(reactions.length, 1);
+    assert.ok(reactions[0].reaction.includes('✔') || reactions[0].reaction.toLowerCase().includes('häkchen'));
+    assert.equal(reactions[0].count, 1);
+  });
+
+  test('extrahiert mehrere Reaktionen mit Zählern (Daumen, Herz)', () => {
+    const container = {
+      getAttribute: () => null,
+      innerText: '',
+      querySelector: () => null,
+      querySelectorAll: (sel) => {
+        if (sel.includes('CounterBadge')) return [];
+        return [
+          makeEl({ ariaLabel: 'Gefällt mir', text: '👍 3', badgeText: '3' }),
+          makeEl({ ariaLabel: 'Herz', text: '❤ 2', badgeText: '2' })
+        ];
+      }
+    };
+    const row = makeRow({ containers: [container] });
+    const reactions = collectReactionsFromRow(row);
+    assert.equal(reactions.length, 2);
+    const like = reactions.find(r => r.reaction.includes('👍') || /gefällt/i.test(r.reaction));
+    const heart = reactions.find(r => r.reaction.includes('❤') || /herz/i.test(r.reaction));
+    assert.ok(like, 'Daumen/Gefällt-mir-Reaktion fehlt');
+    assert.ok(heart, 'Herz-Reaktion fehlt');
+    assert.equal(like.count, 3);
+    assert.equal(heart.count, 2);
+  });
+
+  test('findet Emoji-Buttons auch ohne expliziten Reaktions-Container', () => {
+    const row = makeRow({
+      buttons: [makeEl({ text: '👍 5' })]
+    });
+    const reactions = collectReactionsFromRow(row);
+    assert.equal(reactions.length, 1);
+    assert.ok(reactions[0].reaction.includes('👍'));
+    assert.equal(reactions[0].count, 5);
+  });
+
+  test('ignoriert Nicht-Reaktions-Buttons (Mehr-Aktionen) ohne Emoji', () => {
+    const row = makeRow({
+      buttons: [makeEl({ ariaLabel: 'More actions', text: '⋯' })]
+    });
+    assert.deepEqual(collectReactionsFromRow(row), []);
+  });
+
+  test('leerer Reaktions-Container -> leeres Array', () => {
+    const row = makeRow({ containers: [] });
+    assert.deepEqual(collectReactionsFromRow(row), []);
   });
 });

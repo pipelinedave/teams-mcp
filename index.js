@@ -104,7 +104,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'teams_get_messages',
-        description: 'Liest die Nachrichtenverläufe eines Chats als Markdown aus (inkl. Autoren, Zeitstempel, Inhalt, Anhang-Metadaten).',
+        description: 'Liest die Nachrichtenverläufe eines Chats als Markdown aus (inkl. Autoren, Zeitstempel, Inhalt, Anhang-Metadaten und Reaktionen/Reactions wie Checkmarks, Daumen, Herzen).',
         inputSchema: {
           type: 'object',
           properties: {
@@ -141,7 +141,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'teams_get_channel_messages',
-        description: 'Liest Nachrichten aus einem TEAM-KANAL (nicht Chat!) als Markdown aus. Navigiert App-Bar -> Team -> Kanal und verifiziert den geöffneten Kanal (Safety-Net, kein Silent-Fehlresolvenz). Optional mit Attachment-Download.',
+        description: 'Liest Nachrichten aus einem TEAM-KANAL (nicht Chat!) als Markdown aus. Navigiert App-Bar -> Team -> Kanal und verifiziert den geöffneten Kanal (Safety-Net, kein Silent-Fehlresolvenz). Optional mit Attachment-Download. Liefert je Nachricht Autor, Zeitstempel, Inhalt, Anhang-Metadaten und Reaktionen (Reactions wie Checkmarks, Daumen, Herzen).',
         inputSchema: {
           type: 'object',
           properties: {

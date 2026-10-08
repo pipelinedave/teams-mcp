@@ -213,6 +213,7 @@ export class TeamsClient {
     const messagesData = await page.evaluate(async ({ max, selfName, helpers, blobTimeoutMs }) => {
       const toIso = new Function('return (' + helpers.toIso + ')')();
       const collectAttachments = new Function('return (' + helpers.collectAttachments + ')')();
+      const collectReactions = new Function('return (' + helpers.collectReactions + ')')();
       const msgs = [];
       // Chat-DOM: chat-pane-message / fui-ChatMessage__body. Kanal-DOM (neues Teams-Web,
       // Befund 01.10.2026): channel-pane-message-Rows mit message-body + post-message-subheader.
@@ -320,7 +321,8 @@ export class TeamsClient {
           mid: mid || undefined,
           timestamp: timestamp || undefined,
           timestampRaw: timestampRaw || undefined,
-          attachments: collectAttachments(row)
+          attachments: collectAttachments(row),
+          reactions: collectReactions(row) || []
         });
       }
 
@@ -394,7 +396,7 @@ export class TeamsClient {
       } catch { /* Blob-Extraktion scheitert nie fatal: Nachrichten bleiben erhalten */ }
 
       return { msgs, blobData, rowBlobUrls };
-    }, { max, selfName: config.selfName, helpers: { toIso: messageTimeToIso.toString(), collectAttachments: collectAttachmentsFromRow.toString() }, blobTimeoutMs: 3000 });
+    }, { max, selfName: config.selfName, helpers: { toIso: messageTimeToIso.toString(), collectAttachments: collectAttachmentsFromRow.toString(), collectReactions: collectReactionsFromRow.toString() }, blobTimeoutMs: 3000 });
 
     const { msgs, blobData, rowBlobUrls } = messagesData;
 
@@ -440,6 +442,7 @@ export class TeamsClient {
         timestamp: m.timestamp,
         timestampRaw: m.timestampRaw,
         attachments: m.attachments || [],
+        reactions: m.reactions || [],
         mediaFiles: (rowBlobUrls && rowBlobUrls[i] || [])
           .map((url) => blobUrlToPath[url])
           .filter(Boolean)
@@ -1741,6 +1744,102 @@ export function collectAttachmentsFromRow(row) {
     const m = NAME_RE.exec(label);
     if (m) push(m[1].trim(), null);
   }
+  return out;
+}
+
+// Reaktionen / Reactions einer Nachricht (Checkmarks, Daumen, Herzen etc.) extrahieren.
+// Läuft serialisiert im Browser-Kontext (page.evaluate) und ist mit einem minimalen
+// DOM-Mock unit-testbar — gleiches Muster wie collectAttachmentsFromRow.
+//
+// Teams-Web rendert Reaktionen als Buttons/Elemente am unteren Rand einer Message-Row,
+// typisch:
+//   - in einem Container wie [data-tid*="reaction"], [class*="reaction"], .fui-ChatMessage__reactions
+//   - mit einem aria-label/title (DE/EN, z.B. "Gefällt mir", "Herz", "Häkchen", "Checkmark")
+//     oder einem Emoji-Zeichen im Text (👍, ❤, ✔, 😄 …)
+//   - optional mit Zähler als fui-CounterBadge/Textzahl (Anzahl der Personen)
+//
+// WICHTIG (Kern von Davids Bug 08.10.2026): Eine "Reaktion" AST ist ein eigenständiges
+// Element NEBEN dem Text-Body der Nachricht und taucht im body.innerText NICHT auf. Nur
+// ein relativer Scan über die Message-ROW (nicht den Body) findet sie.
+export function collectReactionsFromRow(row) {
+  const out = [];
+  if (!row || typeof row.querySelectorAll !== 'function') return out;
+  const seen = new Set();
+
+  // Bekannte Reaktions-Begriffe (DE + EN) für aria-label/title/title-Text-Matching.
+  // "Häkchen"/"Checkmark" ist die formal relevante Freigabe-Reaktion (Birgit Eilers).
+  const LABEL_WORDS = [
+    'gefällt', 'like', 'herz', 'heart', 'liebe', 'love', 'lachen', 'laugh',
+    'applaus', 'applause', 'händeklatschen', 'clap', 'überrascht', 'surprise',
+    'traurig', 'sad', 'wütend', 'angry', 'daumen', 'thumb', 'hashtag',
+    'häkchen', 'check', 'haken', 'okay', 'na klar', 'thumbs', 'danke', 'thanks', 'gift'
+  ];
+  // Bekannte Reaktions-Emojis (als Unicode-Zeichen; Häkchen/Checkmark vorangestellt,
+  // da formal für Freigaben). Gängige Teams-Reaktionsset-Emojis.
+  const EMOJI_RE = /(✔|✓|🗸|✅|👍|👎|❤|💖|😀|😄|😂|😆|🤣|😮|😲|😢|😭|😡|👏|🙌|🎉|🥳|💯|❗|❓|🙏|🤝|⭐|❤️|🟢)/;
+
+  const push = (name, count) => {
+    const key = `${name}|${count}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ reaction: name, count });
+  };
+
+  const cleanLabel = (raw) => {
+    // aus "Mein Text" bzw. aria-label wie "Gefällt mir (5)"/ "Häkchen" die Reaktion ableiten
+    const t = String(raw || '').trim();
+    if (!t) return '';
+    const m = EMOJI_RE.exec(t);
+    if (m) return m[1]; // Emoji direkt
+    return t;
+  };
+
+  const countFrom = (el) => {
+    // Zähler: fui-CounterBadge oder sichtbare Zahl am Reaktions-Button
+    let cnt = null;
+    const badge = el.querySelector && el.querySelector('[class*="CounterBadge" i], [class*="counter" i], [data-tid*="count" i]');
+    if (badge) {
+      const n = Number.parseInt(String(badge.innerText || badge.getAttribute('aria-label') || '').replace(/\D/g, ''), 10);
+      if (Number.isFinite(n)) cnt = n;
+    }
+    if (cnt === null) {
+      const n = Number.parseInt(String(el.innerText || '').replace(/[^\d]/g, ''), 10);
+      if (Number.isFinite(n) && n > 0) cnt = n;
+    }
+    return cnt;
+  };
+
+  // Kandidaten sammeln: alle Reaktions-Container bzw. Buttons, die wie eine Reaktion aussehen.
+  const containers = row.querySelectorAll('[data-tid*="reaction" i], [class*="reaction" i], [class*="Reaction" i], [class*="Reactions" i]') || [];
+
+  // 1) Direkte Kinder aus Reaktions-Containern (häufigste Struktur)
+  for (const c of containers) {
+    const children = (c.querySelectorAll && c.querySelectorAll('button, [role="button"], [role="img"]')) || [c];
+    for (const el of children) {
+      const label = String(((el.getAttribute && el.getAttribute('aria-label')) || (el.getAttribute && el.getAttribute('title')) || el.innerText || '') + '').trim();
+      const name = cleanLabel(label);
+      if (!name) continue;
+      const hook = String(((el.getAttribute && el.getAttribute('aria-label')) || (el.getAttribute && el.getAttribute('title')) || '') + '').toLowerCase();
+      const isLabelMatch = LABEL_WORDS.some(w => hook.includes(w));
+      if (!isLabelMatch && !EMOJI_RE.test(label)) continue;
+      push(name, countFrom(el));
+    }
+  }
+
+  // 2) Falls keine Reaktions-Container existierten: Buttons der Row mit Emoji + CounterBadge
+  //    direkt scannen (robust gegen variierende data-tid-Namen).
+  if (out.length === 0) {
+    const buttons = row.querySelectorAll('button, [role="button"]') || [];
+    for (const b of buttons) {
+      const inner = String(b.innerText || '').trim();
+      if (!EMOJI_RE.test(inner)) continue;
+      const label = String(((b.getAttribute && b.getAttribute('aria-label')) || (b.getAttribute && b.getAttribute('title')) || inner) + '').trim();
+      const name = cleanLabel(label);
+      if (!name) continue;
+      push(name, countFrom(b));
+    }
+  }
+
   return out;
 }
 
