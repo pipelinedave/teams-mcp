@@ -22,11 +22,29 @@ und Nachrichten senden – jeweils in einem isolierten Browser-Profil pro Konto/
   `teams_start_tracking`, `teams_stop_tracking`, `teams_close`.
 - **Kanal-Nachrichten lesen**: `teams_get_channel_messages` navigiert über den Team-/Kanal-Baum
   (Sektion „Teams and channels“ der linken Rail) und liest Nachrichten aus Team-Kanälen —
-  inkl. Autor, Zeitstempel, Text (Markdown) und Anhänge-Metadaten. Parameter: `team_name`,
+  inkl. Autor, Zeitstempel (ISO), Text (Markdown), Reaktionen und Anhänge-Metadaten. Parameter: `team_name`,
   `channel_name` (Default „Allgemein“), `limit`. Ein Sicherheitsnetz verifiziert nach der
   Navigation, dass der geöffnete Kanal dem Ziel entspricht (Header, `document.title`, Baum-
   Selektion) — sonst klarer Fehler statt falscher Daten. `teams_list_teams` liefert dazu die
   Team-/Kanal-Struktur (`teams: [{ name, channels: [...] }]`).
+- **Message Reactions (Emojis/Reaktionen)**: `teams_get_messages` und
+  `teams_get_channel_messages` liefern je Nachricht ein `reactions`-Array mit
+  `{ type, emoji, custom, count, byMe, label }`. Reaktionen stehen im Teams-DOM als eigenes
+  Control **neben** dem Text-Body (`.fui-ChatMessage__reactions` /
+  `button[data-tid="diverse-reaction-pill-button"]`) und tauchen daher nicht im Nachrichten-Text
+  auf. `type` ist der sprachunabhängige Teams-Slug (`heart`, `yes`/`Like`, `laugh`, `rofl`,
+  `cry`, `surprised`, `headstone`, `2705_whiteheavycheckmark`/✅ …), `byMe` unterscheidet eigene
+  von fremden Reaktionen (`aria-pressed`). Bei Custom-Emoji ist `emoji: null` und `custom: true`
+  (Teams liefert dort eine ID statt eines Glyphs). **Praxisrelevant:** formale Freigaben werden in
+  Teams häufig ausschließlich per ✅-Reaktion erteilt — eine solche Reaktion ist in `reactions`
+  sichtbar und darf nicht als „keine Rückmeldung“ gewertet werden. Reaktions-Chrome wird aus dem
+  Markdown-Text entfernt, damit das Emoji den Nachrichtentext nicht verfälscht.
+- **Autoren & Zeitstempel**: `author` liefert den echten Anzeigenamen (nicht mehr „Unbekannt“),
+  `isOwn` kennzeichnet eigene Nachrichten. Für Kanal-Nachrichten wird der Subheader-Zeitstempel
+  („6/23 4:44 PM“, „23.06. 16:44“) inkl. **abgeleitetem Jahr** zu ISO-8601 normalisiert
+  (`parseChannelDateTime`); das Jahr wird aus dem Zeitstempel der vorherigen Nachricht bzw.
+  über eine Plausibilitätsprüfung gegen „jetzt“ bestimmt. `timestampRaw` enthält weiterhin den
+  Originalwert.
 - **Anhänge herunterladen**: `teams_get_messages` und `teams_get_channel_messages` akzeptieren
   `download_attachments: true` (optional `download_limit`, `download_extensions` z.B.
   `[".pptx", ".pdf"]` als Whitelist). Playwright-native Downloads (`page.on('download')` +

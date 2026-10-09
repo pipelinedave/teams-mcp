@@ -6,6 +6,7 @@ import path from 'node:path';
 import {
   TeamsClient,
   messageTimeToIso,
+  parseChannelDateTime,
   mimeToExt,
   sanitizeFilename,
   saveBlobDataUrl,
@@ -1211,6 +1212,115 @@ describe('Baustein B - Extension-Whitelist & Download-Helfer', () => {
     const weird = nextAvailablePath(dir, 'a/b:c*.pptx');
     assert.ok(!weird.includes('/b:') || path.basename(weird).indexOf(':') === -1);
     assert.ok(fs.existsSync(path.dirname(weird)));
+  });
+});
+
+describe('Baustein D - parseChannelDateTime (Kanal-Zeitstempel -> ISO mit Jahres-Ableitung)', () => {
+  // Anker: 09.10.2026, 10:00 Ortszeit (wie beim Live-Test).
+  const NOW = new Date(2026, 9, 9, 10, 0, 0);
+
+  test('US-Format ohne Jahr -> ISO mit Anker-Jahr (Live-Fall "6/23 4:44 PM")', () => {
+    const iso = parseChannelDateTime('6/23 4:44 PM', { now: NOW });
+    const d = new Date(iso);
+    assert.equal(d.getFullYear(), 2026);
+    assert.equal(d.getMonth(), 5);      // Juni
+    assert.equal(d.getDate(), 23);
+    assert.equal(d.getHours(), 16);     // 4:44 PM
+    assert.equal(d.getMinutes(), 44);
+  });
+
+  test('AM/PM-Korrektur: 12:00 AM -> 00:00, 12:30 PM -> 12:30', () => {
+    const am = new Date(parseChannelDateTime('6/23 12:00 AM', { now: NOW }));
+    assert.equal(am.getHours(), 0);
+    const pm = new Date(parseChannelDateTime('6/23 12:30 PM', { now: NOW }));
+    assert.equal(pm.getHours(), 12);
+    const pm5 = new Date(parseChannelDateTime('6/23 5:05 PM', { now: NOW }));
+    assert.equal(pm5.getHours(), 17);
+    assert.equal(pm5.getMinutes(), 5);
+  });
+
+  test('Deutsches Format ohne Jahr ("23.06. 16:44") -> ISO', () => {
+    const d = new Date(parseChannelDateTime('23.06. 16:44', { now: NOW }));
+    assert.equal(d.getFullYear(), 2026);
+    assert.equal(d.getMonth(), 5);
+    assert.equal(d.getDate(), 23);
+    assert.equal(d.getHours(), 16);
+  });
+
+  test('explizites Jahr hat Vorrang und wird nicht umgerechnet', () => {
+    const d = new Date(parseChannelDateTime('9/23/2025 3:46 PM', { now: NOW }));
+    assert.equal(d.getFullYear(), 2025);
+    assert.equal(d.getMonth(), 8);
+    assert.equal(d.getDate(), 23);
+    const de = new Date(parseChannelDateTime('23.06.2024 16:44', { now: NOW }));
+    assert.equal(de.getFullYear(), 2024);
+  });
+
+  test('Jahreswechsel ueber after-Anker: Datum VOR letzter Nachricht -> +1 Jahr', () => {
+    // Letzte Nachricht war 20.12.2026, aktuelle Raw-Angabe lautet "1/2 9:00 AM"
+    const after = new Date(2026, 11, 20, 9, 0, 0);
+    const d = new Date(parseChannelDateTime('1/2 9:00 AM', { now: NOW, after }));
+    assert.equal(d.getFullYear(), 2027);
+    assert.equal(d.getMonth(), 0);
+    assert.equal(d.getDate(), 2);
+  });
+
+  test('after-Anker NICHT angewendet, wenn Datum >= letzter Nachricht', () => {
+    const after = new Date(2026, 5, 1, 9, 0, 0);   // 01.06.2026
+    const d = new Date(parseChannelDateTime('6/23 4:44 PM', { now: NOW, after }));
+    assert.equal(d.getFullYear(), 2026);
+  });
+
+  test('Zukunfts-Heuristik: "12/25" im Januar -> Vorjahr', () => {
+    const jan = new Date(2027, 0, 5, 10, 0, 0);
+    const d = new Date(parseChannelDateTime('12/25 10:00 AM', { now: jan }));
+    assert.equal(d.getFullYear(), 2026);
+    assert.equal(d.getMonth(), 11);
+    assert.equal(d.getDate(), 25);
+  });
+
+  test('"Heute/spaeter heute" wird NICHT ins Vorjahr geschoben (36h-Toleranz)', () => {
+    // jetzt = 09.10.2026 10:00, Nachricht "9/9 4:44 PM" = heute 16:44
+    const d = new Date(parseChannelDateTime('9/9 4:44 PM', { now: NOW }));
+    assert.equal(d.getFullYear(), 2026);
+    assert.equal(d.getDate(), 9);
+    assert.equal(d.getHours(), 16);
+  });
+
+  test('Relativtage: "Today at 3:44 PM" und "Yesterday at 3:44 PM"', () => {
+    const today = new Date(parseChannelDateTime('Today at 3:44 PM', { now: NOW }));
+    assert.equal(today.getFullYear(), 2026);
+    assert.equal(today.getDate(), 9);
+    assert.equal(today.getHours(), 15);
+
+    const yest = new Date(parseChannelDateTime('Yesterday at 3:44 PM', { now: NOW }));
+    assert.equal(yest.getDate(), 8);
+  });
+
+  test('DE-Relativtage: "Heute um 16:44" / "Gestern um 16:44"', () => {
+    const heute = new Date(parseChannelDateTime('Heute um 16:44', { now: NOW }));
+    assert.equal(heute.getDate(), 9);
+    assert.equal(heute.getHours(), 16);
+    const gestern = new Date(parseChannelDateTime('Gestern um 16:44', { now: NOW }));
+    assert.equal(gestern.getDate(), 8);
+  });
+
+  test('Robustheit: unsinnige Eingaben -> null', () => {
+    assert.equal(parseChannelDateTime(null), null);
+    assert.equal(parseChannelDateTime(undefined), null);
+    assert.equal(parseChannelDateTime(''), null);
+    assert.equal(parseChannelDateTime('   '), null);
+    assert.equal(parseChannelDateTime('kein Datum'), null);
+    assert.equal(parseChannelDateTime('99999'), null);
+  });
+
+  test('Monats-Tag-Verwechslung: US-Slash = Monat/Tag, Punkt = Tag/Monat', () => {
+    const us = new Date(parseChannelDateTime('6/23 4:44 PM', { now: NOW }));   // 23. Juni
+    const de = new Date(parseChannelDateTime('23.06. 16:44', { now: NOW }));   // 23. Juni
+    assert.equal(us.getDate(), 23);
+    assert.equal(us.getMonth(), 5);
+    assert.equal(de.getDate(), 23);
+    assert.equal(de.getMonth(), 5);
   });
 });
 

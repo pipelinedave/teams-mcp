@@ -215,6 +215,7 @@ export class TeamsClient {
       const collectAttachments = new Function('return (' + helpers.collectAttachments + ')')();
       const collectReactions = new Function('return (' + helpers.collectReactions + ')')();
       const isReactionArtifact = new Function('return (' + helpers.isReactionArtifact + ')')();
+      const parseChannelDateTime = new Function('return (' + helpers.parseChannelDateTime + ')')();
       const msgs = [];
       // Chat-DOM: chat-pane-message / fui-ChatMessage__body. Kanal-DOM (neues Teams-Web,
       // Befund 01.10.2026): channel-pane-message-Rows mit message-body + post-message-subheader.
@@ -358,6 +359,18 @@ export class TeamsClient {
           }
         }
 
+        // Strategie 5 (Kanäle, Live-Befund 09.10.2026): Der Subheader liefert nur
+        // "6/23 4:44 PM" / "23.06. 16:44" — ohne Jahr und ohne ISO. Nachrichten im Pane
+        // laufen aufsteigend, deshalb wird die bereits aufgeloeste Zeit der VORHERIGEN
+        // Nachricht als `after`-Anker uebergeben: ein Datum davor erzwingt +1 Jahr.
+        // Ohne diesen Schritt war keine beleggenaue Zuordnung moeglich (alle Kanal-
+        // Zeitstempel blieben unbrauchbar).
+        if (!timestamp && timestampRaw) {
+          const prevIso = msgs.length ? msgs[msgs.length - 1].timestamp : null;
+          const isoFromRaw = parseChannelDateTime(timestampRaw, { now: Date.now(), after: prevIso });
+          if (isoFromRaw) timestamp = isoFromRaw;
+        }
+
         msgs.push({
           author: author || 'Unbekannt',
           isOwn: isMe || undefined,
@@ -441,7 +454,7 @@ export class TeamsClient {
       } catch { /* Blob-Extraktion scheitert nie fatal: Nachrichten bleiben erhalten */ }
 
       return { msgs, blobData, rowBlobUrls };
-    }, { max, selfName: config.selfName, helpers: { toIso: messageTimeToIso.toString(), collectAttachments: collectAttachmentsFromRow.toString(), collectReactions: collectReactionsFromRow.toString(), isReactionArtifact: isReactionArtifact.toString() }, blobTimeoutMs: 3000 });
+    }, { max, selfName: config.selfName, helpers: { toIso: messageTimeToIso.toString(), collectAttachments: collectAttachmentsFromRow.toString(), collectReactions: collectReactionsFromRow.toString(), isReactionArtifact: isReactionArtifact.toString(), parseChannelDateTime: parseChannelDateTime.toString() }, blobTimeoutMs: 3000 });
 
     const { msgs, blobData, rowBlobUrls } = messagesData;
 
@@ -1614,6 +1627,120 @@ export function messageTimeToIso(raw) {
     const d = new Date(s);
     if (!isNaN(d.getTime())) return d.toISOString();
   }
+  return null;
+}
+
+// Parst den menschenlesbaren Zeitstempel-Text, den Teams im Channel-Subheader bzw. im
+// Chat-Header ausgibt, zu ISO-8601 — und ergänzt das dort FEHLENDE Jahr.
+//
+// Warum nötig (Live-Befund 09.10.2026, Kanal "PUBS > Allgemein"): der Subheader liefert
+// nur "6/23 4:44 PM" bzw. "23.06. 16:44" — ohne Jahr und ohne ISO. Damit war keine
+// beleggenaue Zuordnung moeglich. Jahres-Ableitung ueber zwei Anker:
+//   1) `after` — der bereits aufgeloeste Zeitstempel der VORHERIGEN Nachricht. Da die
+//      Nachrichten im Pane aufsteigend sortiert sind, bedeutet ein Datum vor `after`
+//      zuverlaessig einen Jahreswechsel -> +1 Jahr. Das ist der verlaesslichste Anker.
+//   2) `now` — plausibilitaetsbasierte Heuristik: liegt der Kandidat weit in der
+//      Zukunft (> 36h), muss es das Vorjahr sein (z.B. "12/25" im Januar). Die 36h
+//      Toleranz sorgt dafuer, dass "heute 4:44 PM" bei jetzt=10:00 NICHT zurueckgeschoben wird.
+//
+// Unterstuetzt: US-Format ("6/23 4:44 PM"), DE-Format ("23.06. 16:44"), beide mit
+// explizitem Jahr, sowie Relativtage ("Today at 3:44 PM", "Gestern um 16:44").
+// Reine Funktion ohne Modul-Scope -> via .toString() serialisierbar + unit-testbar.
+export function parseChannelDateTime(raw, opts = {}) {
+  if (raw == null) return null;
+  const now = opts.now ? new Date(opts.now) : new Date();
+  if (isNaN(now.getTime())) return null;
+  const afterMs = opts.after ? new Date(opts.after).getTime() : NaN;
+
+  const s = String(raw)
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^(at|um)\s+/i, '')
+    .replace(/[,;]\s*$/, '')
+    .trim();
+  if (!s) return null;
+
+  const mk = (y, mo, d, h, mi) => {
+    const dt = new Date(y, mo - 1, d, h, mi, 0, 0);
+    if (isNaN(dt.getTime())) return null;
+    if (dt.getFullYear() < 2000 || dt.getFullYear() > 2100) return null;
+    return dt;
+  };
+  const to12h = (h, ampm) => {
+    const ampmL = String(ampm || '').toLowerCase();
+    let hh = Number(h);
+    if (ampmL === 'pm' && hh < 12) hh += 12;
+    if (ampmL === 'am' && hh === 12) hh = 0;
+    return hh;
+  };
+
+  // 1) Relativtage (Chat-Header): "Today at 3:44 PM", "Yesterday at 3:44 PM", "Gestern um 16:44"
+  const rel = /(today|heute|yesterday|gestern)\D{0,12}?(\d{1,2}):(\d{2})\s*(am|pm)?/i.exec(s);
+  if (rel) {
+    const base = new Date(now.getFullYear(), now.getMonth(), now.getDate(),
+      to12h(rel[2], rel[4]), Number(rel[3]), 0, 0);
+    if (/yesterday|gestern/i.test(rel[1])) base.setDate(base.getDate() - 1);
+    return isNaN(base.getTime()) ? null : base.toISOString();
+  }
+
+  // 2) MIT explizitem Jahr: "9/23/2025 3:46 PM" oder "23.06.2025 16:44"
+  //    ( Trenner / . - ; US=Monat/Tag, Punkte = Tag/Monat )
+  let m = /^(\d{1,2})([./-])(\d{1,2})\2(\d{4})\s+(\d{1,2}):(\d{2})\s*(am|pm)?$/i.exec(s);
+  if (m) {
+    const first = Number(m[1]);
+    const second = Number(m[3]);
+    const usOrder = m[2] === '/';
+    const month = usOrder ? first : second;
+    const day = usOrder ? second : first;
+    const dt = mk(Number(m[4]), month, day, to12h(m[5], m[7]), Number(m[6]));
+    return dt ? dt.toISOString() : null;
+  }
+
+  // 3) OHNE Jahr — die Jahres-Ableitung ist der eigentliche Zweck dieser Funktion.
+  const buildYearless = (month, day, hour, minute) => {
+    const y0 = now.getFullYear();
+    let dt = mk(y0, month, day, hour, minute);
+    if (!dt) return null;
+    // Anker 1: Nachrichten laufen aufsteigend -> Datum vor der vorigen Nachricht = +1 Jahr
+    if (Number.isFinite(afterMs) && dt.getTime() < afterMs) {
+      const plus = mk(y0 + 1, month, day, hour, minute);
+      if (plus) return plus;
+    }
+    // Anker 2: weit in der Zukunft -> muss Vorjahr sein (z.B. "12/25" im Januar)
+    if (dt.getTime() > now.getTime() + 36 * 3600 * 1000) {
+      const minus = mk(y0 - 1, month, day, hour, minute);
+      if (minus) return minus;
+    }
+    return dt;
+  };
+
+  // 3a) DE-Format: "23.06. 16:44"
+  m = /^(\d{1,2})\.(\d{1,2})\.\s+(\d{1,2}):(\d{2})$/.exec(s) || /^(\d{1,2})\.(\d{1,2})\.\s*(\d{1,2}):(\d{2})$/.exec(s);
+  if (m) {
+    const dt = buildYearless(Number(m[2]), Number(m[1]), Number(m[3]), Number(m[4]));
+    return dt ? dt.toISOString() : null;
+  }
+
+  // 3b) US-Format: "6/23 4:44 PM"
+  m = /^(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{2})\s*(am|pm)?$/i.exec(s);
+  if (m) {
+    const dt = buildYearless(Number(m[1]), Number(m[2]), to12h(m[3], m[5]), Number(m[4]));
+    return dt ? dt.toISOString() : null;
+  }
+
+  // 4) Nur Datum + Jahrlos-Zeit ohne Minute, defensiv: "6/23 4:44" ohne AM/PM
+  m = /^(\d{1,2})[\/.](\d{1,2})\s+(\d{1,2}):(\d{2})$/.exec(s);
+  if (m) {
+    const usOrder = s.includes('/');
+    const first = Number(m[1]);
+    const second = Number(m[2]);
+    const month = usOrder ? first : second;
+    const day = usOrder ? second : first;
+    const dt = buildYearless(month, day, Number(m[3]), Number(m[4]));
+    return dt ? dt.toISOString() : null;
+  }
+
   return null;
 }
 
