@@ -45,6 +45,13 @@ und Nachrichten senden – jeweils in einem isolierten Browser-Profil pro Konto/
   (`parseChannelDateTime`); das Jahr wird aus dem Zeitstempel der vorherigen Nachricht bzw.
   über eine Plausibilitätsprüfung gegen „jetzt“ bestimmt. `timestampRaw` enthält weiterhin den
   Originalwert.
+- **Nachrichten-Suche**: `teams_search` liest die echte Teams-Suchansicht aus
+  (`[data-tid="search-layout"]`-Karten) und liefert strukturierte Treffer:
+  `{ kind: message|file|meeting, chat, channel|members, author, timestamp (ISO),
+  timestampRaw, snippet, highlighted, attachments, preview }`. Der Autor wird aus der
+  Avatar-URL (`?displayname=…`) gewonnen, nackten Uhrzeitangaben („9:27 AM“) wird „heute“
+  zugeordnet. Hinweis: Treffer sind wie im Teams-UI **relevanzsortiert**, nicht chronologisch —
+  dafür wird der aufsteigende Jahres-Anker bewusst nicht angewendet.
 - **Anhänge herunterladen**: `teams_get_messages` und `teams_get_channel_messages` akzeptieren
   `download_attachments: true` (optional `download_limit`, `download_extensions` z.B.
   `[".pptx", ".pdf"]` als Whitelist). Playwright-native Downloads (`page.on('download')` +

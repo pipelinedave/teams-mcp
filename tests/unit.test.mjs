@@ -7,6 +7,7 @@ import {
   TeamsClient,
   messageTimeToIso,
   parseChannelDateTime,
+  searchExtractResults,
   mimeToExt,
   sanitizeFilename,
   saveBlobDataUrl,
@@ -1305,6 +1306,48 @@ describe('Baustein D - parseChannelDateTime (Kanal-Zeitstempel -> ISO mit Jahres
     assert.equal(gestern.getDate(), 8);
   });
 
+  test('Wochentag ("Monday 1:50 PM") = letzter vergangener Tag dieses Namens', () => {
+    // NOW = Freitag, 09.10.2026 (Freitag=5). Montag=1 -> 4 Tage zurueck = 05.10.2026
+    const d = new Date(parseChannelDateTime('Monday 1:50 PM', { now: NOW }));
+    assert.equal(d.getFullYear(), 2026);
+    assert.equal(d.getMonth(), 9);
+    assert.equal(d.getDate(), 5);      // Montag vor Freitag
+    assert.equal(d.getHours(), 13);    // 1:50 PM
+    assert.equal(d.getMinutes(), 50);
+  });
+
+  test('Deutscher Wochentag ("Freitag, 16:44")', () => {
+    const d = new Date(parseChannelDateTime('Freitag, 16:44', { now: NOW }));
+    assert.equal(d.getDate(), 9);      // NOW ist selbst Freitag
+    assert.equal(d.getHours(), 16);
+  });
+
+  test('Wochentag heute selbst -> gleiches Datum (daysBack=0)', () => {
+    const d = new Date(parseChannelDateTime('Friday 9:00 AM', { now: NOW }));
+    assert.equal(d.getDate(), 9);
+    assert.equal(d.getHours(), 9);
+  });
+
+  test('after-Anker greift nur bei plausibler Jahresgrenze (>180 Tage Lücke)', () => {
+    // Relevanz-sortierte Suchergebnisse: "10/5" gefolgt von "9/11" -> KEIN Jahreswechsel
+    const after = new Date(2026, 9, 5, 11, 50, 0);
+    const d = new Date(parseChannelDateTime('9/11 3:50 PM', { now: NOW, after }));
+    assert.equal(d.getFullYear(), 2026);
+
+    // Echte Jahresgrenze: "12/30" gefolgt von "1/2" (Lücke ~360 Tage) -> +1 Jahr
+    const afterDec = new Date(2026, 11, 30, 21, 0, 0);
+    const d2 = new Date(parseChannelDateTime('1/2 9:00 AM', { now: NOW, after: afterDec }));
+    assert.equal(d2.getFullYear(), 2027);
+  });
+
+  test('nur Uhrzeit ("9:27 AM") = heute (Teams-Konvention)', () => {
+    const d = new Date(parseChannelDateTime('9:27 AM', { now: NOW }));
+    assert.equal(d.getFullYear(), 2026);
+    assert.equal(d.getDate(), 9);      // NOW ist der 09.10.
+    assert.equal(d.getHours(), 9);
+    assert.equal(d.getMinutes(), 27);
+  });
+
   test('Robustheit: unsinnige Eingaben -> null', () => {
     assert.equal(parseChannelDateTime(null), null);
     assert.equal(parseChannelDateTime(undefined), null);
@@ -1321,6 +1364,183 @@ describe('Baustein D - parseChannelDateTime (Kanal-Zeitstempel -> ISO mit Jahres
     assert.equal(us.getMonth(), 5);
     assert.equal(de.getDate(), 23);
     assert.equal(de.getMonth(), 5);
+  });
+});
+
+describe('Baustein E - searchExtractResults (Teams-Suchergebnisse, Spec-Befund 2)', () => {
+  // DOM-Mock nachgebildet am LIVE-BEFUND 09.10.2026 (Suche "Aktenplanmigration"):
+  // je Ergebnis ein [data-tid="search-layout"] mit message-app-card-header
+  // (Zeile 1 Chat, Zeile 2 Mitglieder/Kanal), Avatar-Img mit displayname in der URL,
+  // highlighted-Spans und file-chiclet-<name> fuer Anhaenge.
+  function makeCard({ chat, second, author, displayname, time, snippet, term = 'Aktenplanmigration', attachments = [], kind = 'message' }) {
+    const headerChildren = [];
+    if (kind === 'message') {
+      headerChildren.push({
+        innerText: `${chat}\n${second}`,
+        getAttribute: (n) => (n === 'data-tid' ? 'message-app-card-header' : null)
+      });
+    }
+    const children = [
+      ...headerChildren,
+      ...(kind === 'message' ? [{
+        tagName: 'SPAN',
+        innerText: '',
+        getAttribute: (n) => {
+          if (n === 'data-tid') return 'message-card-avatar';
+          if (n === 'src') return `https://teams.cloud.microsoft/api/mt/emea/beta/users/x/profilepicturev2/8:orgid:y?displayname=${encodeURIComponent(displayname || author)}&size=HR64x64`;
+          return null;
+        }
+      }] : []),
+      ...(kind === 'file' ? [{
+        innerText: snippet,
+        getAttribute: (n) => (n === 'data-tid' ? 'serp-file-preview-summary' : null)
+      }] : []),
+      {
+        innerText: term,
+        getAttribute: (n) => (n === 'data-tid' ? 'highlighted' : null)
+      },
+      ...attachments.map((name) => ({
+        innerText: name,
+        getAttribute: (n) => (n === 'data-tid' ? `file-chiclet-${name}` : null)
+      }))
+    ];
+    return {
+      innerText: [
+        chat,
+        second,
+        ...(kind === 'message' ? [author, time] : []),
+        snippet,
+        ...attachments
+      ].join('\n'),
+      getAttribute: (n) => (n === 'data-tid' ? 'search-layout' : null),
+      querySelector: (sel) => children.find((c) => {
+        const tid = (c.getAttribute && c.getAttribute('data-tid')) || '';
+        if (sel.includes('message-app-card-header')) return tid === 'message-app-card-header';
+        if (sel.includes('message-card-avatar')) return tid === 'message-card-avatar';
+        if (sel.includes('serp-file-preview-summary')) return tid === 'serp-file-preview-summary';
+        return false;
+      }) || null,
+      querySelectorAll: (sel) => {
+        if (sel.includes('highlighted')) {
+          return children.filter((c) => (c.getAttribute && c.getAttribute('data-tid')) === 'highlighted');
+        }
+        if (sel.includes('file-chiclet-')) {
+          return children.filter((c) => String((c.getAttribute && c.getAttribute('data-tid')) || '').startsWith('file-chiclet-'));
+        }
+        if (sel === '[data-tid]') {
+          return children.filter((c) => c.getAttribute && c.getAttribute('data-tid'));
+        }
+        return [];
+      }
+    };
+  }
+  function makeRoot(cards) {
+    return { querySelectorAll: (sel) => (sel.includes('search-layout') || sel.includes('search-card') ? cards : []) };
+  }
+
+  test('extrahiert strukturierte Felder aus einer Message-Card (Live-Struktur)', () => {
+    const root = makeRoot([
+      makeCard({
+        chat: 'PUBS: Fokusteam Aktenplan-Migration',
+        second: 'Allgemein',
+        author: 'Messe, Adrian',
+        displayname: 'Messe, Adrian',
+        time: '9/11 3:50 PM',
+        snippet: 'Agent Aktenplanmigration - Hoi zusammen, ich habe einen Agenten gebaut'
+      })
+    ]);
+    const items = (() => {
+      global.document = { querySelectorAll: (sel) => (sel.includes('search-layout') ? [makeCard({
+        chat: 'PUBS: Fokusteam Aktenplan-Migration',
+        second: 'Allgemein',
+        author: 'Messe, Adrian',
+        displayname: 'Messe, Adrian',
+        time: '9/11 3:50 PM',
+        snippet: 'Agent Aktenplanmigration - Hoi zusammen, ich habe einen Agenten gebaut'
+      })] : []) };
+      try { return searchExtractResults({ max: 10 }); } finally { delete global.document; }
+    })();
+    assert.equal(items.length, 1);
+    const r = items[0];
+    assert.equal(r.kind, 'message');
+    assert.equal(r.chat, 'PUBS: Fokusteam Aktenplan-Migration');
+    assert.equal(r.channel, 'Allgemein');
+    assert.equal(r.author, 'Messe, Adrian');
+    assert.equal(r.timestampRaw, '9/11 3:50 PM');
+    assert.ok(r.snippet.includes('Agent Aktenplanmigration'));
+    assert.ok(r.highlighted.includes('Aktenplanmigration'));
+  });
+
+  test('Mitgliederliste wird als members erkannt, nicht als channel', () => {
+    const items = (() => {
+      global.document = { querySelectorAll: () => [makeCard({
+        chat: 'Gesamt-JF Aktenplanmigration',
+        second: 'You, Bahrenberg, Daniel, Behncke, Lukas (d.velop Extern), +20',
+        author: 'Dau, Philipp',
+        displayname: 'Dau, Philipp',
+        time: '9/29 4:22 PM',
+        snippet: 'Das Template für den Kickoff ist fertig'
+      })] };
+      try { return searchExtractResults({ max: 10 }); } finally { delete global.document; }
+    })();
+    const r = items[0];
+    assert.equal(r.chat, 'Gesamt-JF Aktenplanmigration');
+    assert.ok(r.members.includes('Bahrenberg'));
+    assert.equal(r.channel, undefined);
+    assert.equal(r.author, 'Dau, Philipp');
+  });
+
+  test('Anhaenge aus file-chiclet-tids und Snippet-Filterung', () => {
+    const items = (() => {
+      global.document = { querySelectorAll: () => [makeCard({
+        chat: 'Gesamt-JF Aktenplanmigration',
+        second: 'You, Bahrenberg, Daniel, +20',
+        author: 'Messe, Adrian',
+        displayname: 'Messe, Adrian',
+        time: '9/29 8:28 AM',
+        snippet: 'hier findet ihr die neue Angebotsstruktur',
+        attachments: ['260929_Template_Kickoff_Aktenplanmigration.pptx']
+      })] };
+      try { return searchExtractResults({ max: 10 }); } finally { delete global.document; }
+    })();
+    const r = items[0];
+    assert.deepEqual(r.attachments, ['260929_Template_Kickoff_Aktenplanmigration.pptx']);
+    assert.ok(!r.snippet.includes('260929_Template')); // Attachment-Name nicht doppelt im Snippet
+  });
+
+  test('File-Ergebnisse werden als kind=file erkannt', () => {
+    const items = (() => {
+      global.document = { querySelectorAll: () => [makeCard({
+        chat: '260623_Vorgehensbeschreibung_Aktenplanmigration.pptx',
+        second: 'PUBS: Fokusteam Aktenplan-Migration',
+        author: 'Messe, Adrian',
+        time: '',
+        snippet: '260623_Vorgehensbeschreibung_Aktenplanmigration.pptx PUBS Allgemein',
+        kind: 'file'
+      })] };
+      try { return searchExtractResults({ max: 10 }); } finally { delete global.document; }
+    })();
+    assert.equal(items[0].kind, 'file');
+  });
+
+  test('max begrenzt die Anzahl, Duplikate werden entfernt', () => {
+    const card = makeCard({
+      chat: 'Chat A', second: 'You, X', author: 'A, B', displayname: 'A, B',
+      time: '9/1 1:00 PM', snippet: 'Treffer Aktenplanmigration'
+    });
+    const items = (() => {
+      global.document = { querySelectorAll: () => [card, card, card] };
+      try { return searchExtractResults({ max: 2 }); } finally { delete global.document; }
+    })();
+    assert.equal(items.length, 1); // identische Karte -> Dedupe
+  });
+
+  test('leeres Such-DOM -> leeres Array', () => {
+    const items = (() => {
+      global.document = { querySelectorAll: () => [] };
+      try { return searchExtractResults({ max: 10 }); } finally { delete global.document; }
+    })();
+    assert.deepEqual(items, []);
   });
 });
 

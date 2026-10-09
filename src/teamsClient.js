@@ -560,15 +560,19 @@ export class TeamsClient {
     const t = browserManager.normalizeTenant(tenant);
     const page = await this.getPage(t, true);
 
-    // Suchfeld finden - Teams Web ändert die DOM-Struktur; mehrere Wege probieren,
-    // inkl. Öffnen der Suche per Tastaturkürzel (Ctrl+E / Ctrl+K / Alt+Shift+S).
+    // Suchfeld finden - Teams Web aendert die DOM-Struktur; mehrere Wege probieren,
+    // inkl. Oeffnen der Suche per Tastaturkuerzel (Ctrl+E / Ctrl+K / Alt+Shift+S).
+    // Live-Befund 09.10.2026: das Feld ist data-tid="AUTOSUGGEST_INPUT" mit
+    // role="combobox" type="search" und placeholder "Search (Ctrl+Alt+E)" — KEIN
+    // aria-label und KEINE id "top-search-input" mehr.
     let searchInput = null;
     const selectors = [
       '#top-search-input',
-      'input[aria-label*="Search"]',
+      '[data-tid="AUTOSUGGEST_INPUT"]',
       'input[placeholder*="Search"]',
-      'input[aria-label*="Suche"]',
+      'input[aria-label*="Search"]',
       'input[placeholder*="Suche"]',
+      'input[aria-label*="Suche"]',
       '[data-tid="searchbox"] input',
       'input[type="search"]'
     ];
@@ -579,7 +583,7 @@ export class TeamsClient {
     }
 
     if (!searchInput) {
-      // Suche per Tastatur öffnen und erneut versuchen
+      // Suche per Tastatur oeffnen und erneut versuchen
       for (const combo of ['Control+E', 'Control+K', 'Alt+Shift+S']) {
         try {
           await page.keyboard.press(combo);
@@ -600,35 +604,53 @@ export class TeamsClient {
     await searchInput.click();
     await page.waitForTimeout(400);
     await searchInput.fill('');
-    // Query per Clipboard-Paste einfügen (robust für Sonderzeichen/Um&laute)
+    // Query per Clipboard-Paste einfügen (robust für Sonderzeichen/Umlaute)
     await page.evaluate((q) => { navigator.clipboard.writeText(q); }, query);
     await page.keyboard.press('ControlOrMeta+V');
     await page.waitForTimeout(400);
+    // Live-Befund 09.10.2026: Clipboard-Write kann je nach Chromium-Konfiguration
+    // still scheitern (Permission) — dann bleibt das Feld leer und die Suche liefert
+    // 0 Treffer. Deshalb verifizieren und auf keyboard.type() zurueckfallen.
+    let typed = await searchInput.evaluate((el) => el.value || '').catch(() => '');
+    if (!typed) {
+      await searchInput.fill('');
+      await searchInput.type(query, { delay: 40 });
+      await page.waitForTimeout(400);
+      typed = await searchInput.evaluate((el) => el.value || '').catch(() => '');
+    }
+    if (!typed) {
+      throw new Error(`Suchbegriff '${query}' konnte nicht ins Suchfeld eingegeben werden (Paste und Tastatur schlugen fehl).`);
+    }
     await page.keyboard.press('Enter');
 
-    await page.waitForTimeout(4000);
-    await page.waitForSelector('div[data-tid*="search-result"], [role="listitem"], [data-tid*="searchResult"]', { timeout: 12000 }).catch(() => null);
+    // Live-Befund 09.10.2026 (d-velop): Die Ergebnis-Ansicht oeffnet sich als eigene
+    // View (document.title -> "Search | Microsoft Teams") und rendert JE Ergebnis als
+    // [data-tid="search-layout"] mit message-app-card-header / message-card-avatar /
+    // highlighted / file-chiclet-*. Die alten Selektoren ("search-result",
+    // "searchResult", [role="listitem"]) existieren in dieser View NICHT — daher
+    // lieferte die Suche dauerhaft 0 Treffer (Spec-Befund 2).
+    await page.waitForSelector('[data-tid="search-layout"], [data-tid="search-card"], [data-tid="search-message-card"]', { timeout: 15000 }).catch(() => null);
+    await page.waitForTimeout(1200);
 
-    const results = await page.evaluate((max) => {
-      const items = [];
-      const rows = document.querySelectorAll('div[data-tid*="search-result"], [data-tid*="searchResult"], [role="listitem"]');
-      for (const r of rows) {
-        if (items.length >= max) break;
-        const text = r.innerText?.trim() || '';
-        if (text && text.length > 10) {
-          items.push({
-            preview: text.split('\n').filter(Boolean).join(' | ')
-          });
-        }
+    const results = await page.evaluate(searchExtractResults, { max: limit });
+
+    // Zeitstempel zu ISO normalisieren. WICHTIG (Live-Fehler 09.10.2026): Suchergebnisse
+    // sind RELEVANZ-sortiert, NICHT chronologisch — der aufsteigende after-Anker aus dem
+    // Kanal-Pfad wuerde hier falsche Jahre erzeugen ("9/11" nach "Monday 1:50 PM" -> 2027).
+    // Daher nur der now-Anker (Teams zeigt jahrlose Daten nur fuer das aktuelle Jahr).
+    for (const r of results) {
+      if (r.timestampRaw) {
+        const iso = parseChannelDateTime(r.timestampRaw, { now: new Date() });
+        if (iso) r.timestamp = iso;
       }
-      return items;
-    }, limit);
+    }
 
     return {
       tenant: t,
       query: query,
       count: results.length,
-      results: results
+      results,
+      ...(results.length === 0 ? { note: 'Keine Treffer in der Teams-Suchansicht gefunden (Suchbegriff evtl. zu spezifisch oder keine Berechtigung).' } : {})
     };
   }
 
@@ -1644,7 +1666,8 @@ export function messageTimeToIso(raw) {
 //      Toleranz sorgt dafuer, dass "heute 4:44 PM" bei jetzt=10:00 NICHT zurueckgeschoben wird.
 //
 // Unterstuetzt: US-Format ("6/23 4:44 PM"), DE-Format ("23.06. 16:44"), beide mit
-// explizitem Jahr, sowie Relativtage ("Today at 3:44 PM", "Gestern um 16:44").
+// explizitem Jahr, Wochentage ("Monday 1:50 PM", "Freitag, 16:44" = letzter vergangener
+// Tag dieses Namens) sowie Relativtage ("Today at 3:44 PM", "Gestern um 16:44").
 // Reine Funktion ohne Modul-Scope -> via .toString() serialisierbar + unit-testbar.
 export function parseChannelDateTime(raw, opts = {}) {
   if (raw == null) return null;
@@ -1684,6 +1707,22 @@ export function parseChannelDateTime(raw, opts = {}) {
     return isNaN(base.getTime()) ? null : base.toISOString();
   }
 
+  // 1b) Wochentag (Suchergebnisse/Kanaele): "Monday 1:50 PM", "Freitag, 16:44".
+  //     Teams meint den LETZTEN vergangenen Tag dieses Namens (Nachrichten sind alt).
+  const WEEKDAYS = {
+    monday: 1, montag: 1, tuesday: 2, dienstag: 2, wednesday: 3, mittwoch: 3,
+    thursday: 4, donnerstag: 4, friday: 5, freitag: 5, saturday: 6, samstag: 6,
+    sonnabend: 6, sunday: 0, sonntag: 0
+  };
+  const wd = /^(monday|montag|tuesday|dienstag|wednesday|mittwoch|thursday|donnerstag|friday|freitag|saturday|samstag|sonnabend|sunday|sonntag)\s*,?\s*(\d{1,2}):(\d{2})\s*(am|pm)?$/i.exec(s);
+  if (wd) {
+    const target = WEEKDAYS[wd[1].toLowerCase()];
+    const daysBack = (now.getDay() - target + 7) % 7;
+    const base = new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysBack,
+      to12h(wd[2], wd[4]), Number(wd[3]), 0, 0);
+    return isNaN(base.getTime()) ? null : base.toISOString();
+  }
+
   // 2) MIT explizitem Jahr: "9/23/2025 3:46 PM" oder "23.06.2025 16:44"
   //    ( Trenner / . - ; US=Monat/Tag, Punkte = Tag/Monat )
   let m = /^(\d{1,2})([./-])(\d{1,2})\2(\d{4})\s+(\d{1,2}):(\d{2})\s*(am|pm)?$/i.exec(s);
@@ -1702,8 +1741,12 @@ export function parseChannelDateTime(raw, opts = {}) {
     const y0 = now.getFullYear();
     let dt = mk(y0, month, day, hour, minute);
     if (!dt) return null;
-    // Anker 1: Nachrichten laufen aufsteigend -> Datum vor der vorigen Nachricht = +1 Jahr
-    if (Number.isFinite(afterMs) && dt.getTime() < afterMs) {
+    // Anker 1: Nachrichten laufen aufsteigend -> Datum vor der vorigen Nachricht = +1 Jahr.
+    // SICHERHEITSGURT (Live-Fehler 09.10.2026, Suchergebnisse sind RELEVANZ-sortiert):
+    // der Anker greift nur, wenn die Luecke groesser 180 Tage ist — eine echte
+    // Jahresgrenze ("12/30" gefolgt von "1/2") hat ~360 Tage Abstand, ein belangloser
+    // Rueckblick ("10/5" gefolgt von "9/11") nur wenige Tage/Wochen.
+    if (Number.isFinite(afterMs) && (afterMs - dt.getTime()) > 180 * 24 * 3600 * 1000) {
       const plus = mk(y0 + 1, month, day, hour, minute);
       if (plus) return plus;
     }
@@ -1741,7 +1784,120 @@ export function parseChannelDateTime(raw, opts = {}) {
     return dt ? dt.toISOString() : null;
   }
 
+  // 5) Nur Uhrzeit ("9:27 AM", "10:22 AM") — Teams zeigt nackte Zeiten nur fuer
+  //    HEUTIGE Nachrichten. Live-Befund 09.10.2026 (Suchergebnisse).
+  m = /^(\d{1,2}):(\d{2})\s*(am|pm)?$/i.exec(s);
+  if (m) {
+    const base = new Date(now.getFullYear(), now.getMonth(), now.getDate(), to12h(m[1], m[3]), Number(m[2]), 0, 0);
+    return isNaN(base.getTime()) ? null : base.toISOString();
+  }
+
   return null;
+}
+
+// Extrahiert Teams-Suchergebnisse aus der Suchansicht (page.evaluate) — pure und
+// self-contained, damit sie via .toString() serialisierbar und unit-testbar ist.
+//
+// Live-Befund 09.10.2026 (d-velop): je Ergebnis existiert [data-tid="search-layout"]
+// mit  message-app-card-header (Zeile 1 Chat/Team, Zeile 2 Mitgliederliste ODER
+// Kanalname),  message-card-avatar img (Autor steckt in ?displayname=... der URL!),
+//  highlighted (getroffene Textstellen)  und  file-chiclet-<name> (Anhaenge).
+// Die frueheren Selektoren ("search-result"/"searchResult"/[role="listitem"])
+// existieren in dieser View NICHT — deshalb lieferte teams_search dauerhaft 0 Treffer.
+export function searchExtractResults({ max = 10 } = {}) {
+  const clean = (s) => String(s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+
+  // Zeitstempel-Kandidat erkennen ("9/29 8:28 AM", "Monday 1:50 PM", "10/1", "Today at ...")
+  const looksLikeTimestamp = (line) => {
+    const l = String(line || '').trim();
+    if (!l || l.length > 40) return false;
+    return /^(today|heute|yesterday|gestern|monday|montag|tuesday|dienstag|wednesday|mittwoch|thursday|donnerstag|friday|freitag|saturday|samstag|sonnabend|sunday|sonntag)\b/i.test(l) ||
+           /^\d{1,2}\/\d{1,2}(\/\d{2,4})?(\s+\d{1,2}:\d{2}\s*(am|pm)?)?$/i.test(l) ||
+           /^\d{1,2}\.\d{1,2}\.(\d{4})?\s*(\d{1,2}:\d{2})?$/i.test(l) ||
+           /^\d{1,2}:\d{2}\s*(am|pm)?$/i.test(l);
+  };
+  // Mitgliederzeile ("You, A, B, +20") vs. Kanalname ("Allgemein")
+  const looksLikeMembers = (line) => /\+\d+\s*$/.test(line) || /^you\b/i.test(line);
+
+  const cards = Array.from(document.querySelectorAll('[data-tid="search-layout"], [data-tid="search-card"]')) || [];
+  const items = [];
+  const seen = new Set();
+
+  for (const card of cards) {
+    if (items.length >= max) break;
+
+    const childTids = Array.from(card.querySelectorAll('[data-tid]')).map((e) => e.getAttribute('data-tid'));
+    const kind = childTids.includes('serp-file-preview-summary') ? 'file'
+      : childTids.some((t) => /^calv2-|^meeting-day$|^meeting-month$/.test(t)) ? 'meeting'
+      : childTids.includes('message-app-card-header') || childTids.includes('search-message-card') ? 'message'
+      : 'other';
+
+    const header = card.querySelector('[data-tid="message-app-card-header"]');
+    const headerLines = header ? (header.innerText || '').split('\n').map((x) => x.trim()).filter(Boolean) : [];
+    const allLines = (card.innerText || '').split('\n').map((x) => x.trim()).filter(Boolean);
+
+    // Autor: die Avatar-URL traegt den Anzeigenamen (?displayname=Messe%2C%20Adrian)
+    const avatar = card.querySelector('[data-tid="message-card-avatar"] img, img[src*="displayname="]');
+    let author = null;
+    if (avatar) {
+      const src = avatar.getAttribute('src') || '';
+      const m = /displayname=([^&]+)/.exec(src);
+      if (m) { try { author = clean(decodeURIComponent(m[1])); } catch { author = clean(m[1]); } }
+    }
+
+    // Chat-Titel = erste Header-Zeile; Zeile 2 = Mitgliederliste ODER Kanalname
+    const chat = headerLines[0] || allLines[0] || null;
+    let channel = null;
+    let members = null;
+    if (headerLines[1]) {
+      if (looksLikeMembers(headerLines[1])) members = headerLines[1];
+      else channel = headerLines[1];
+    }
+
+    // Zeitstempel: erste Zeile, die wie eine Zeit aussieht (nach der Autor-Zeile)
+    let timestampRaw = null;
+    const startIdx = Math.max(allLines.findIndex((l) => author && l === author), 0);
+    for (let i = startIdx; i < allLines.length; i++) {
+      if (looksLikeTimestamp(allLines[i])) { timestampRaw = allLines[i]; break; }
+    }
+
+    // Snippet: Zeilen nach dem Zeitstempel ohne Attachment-/Locations-Rauschen
+    const attachments = [...new Set(childTids.filter((t) => t.startsWith('file-chiclet-')).map((t) => t.slice('file-chiclet-'.length)))];
+    const snippetLines = [];
+    let inSnippet = false;
+    for (const line of allLines) {
+      if (timestampRaw && line === timestampRaw) { inSnippet = true; continue; }
+      if (!inSnippet) continue;
+      if (attachments.includes(line)) continue;
+      if (/^[^>]+>[^>]+$/.test(line) && line.length < 60) continue; // "Team > Kanal"
+      snippetLines.push(line);
+    }
+    const snippet = clean(snippetLines.join(' ')) || null;
+
+    const highlighted = [...new Set(
+      Array.from(card.querySelectorAll('[data-tid="highlighted"]'))
+        .map((e) => clean(e.innerText))
+        .filter(Boolean)
+    )];
+
+    const rec = {
+      kind,
+      chat,
+      ...(channel ? { channel } : {}),
+      ...(members ? { members } : {}),
+      ...(author ? { author } : {}),
+      timestampRaw,
+      snippet,
+      ...(highlighted.length ? { highlighted } : {}),
+      ...(attachments.length ? { attachments } : {}),
+      preview: clean(card.innerText).slice(0, 300)
+    };
+    const key = `${rec.chat}|${rec.author}|${rec.timestampRaw}|${rec.snippet || ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push(rec);
+  }
+  return items;
 }
 
 // Pseudo-Einträge im Team-/Kanal-Baum, die keine echten Teams/Kanäle sind
