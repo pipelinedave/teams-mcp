@@ -228,26 +228,49 @@ export class TeamsClient {
       const msgRowFor = (body) => body.closest('[data-tid="channel-pane-message"], .fui-ChatMessage, .fui-ChatMyMessage, [role="listitem"], [role="group"]') || body;
 
       for (const body of slice) {
-        let author = '';
-        let parent = body.closest('[role="group"], [role="listitem"], .fui-ChatMessage, .fui-ChatMyMessage') || body.parentElement;
-        if (parent) {
-          const authorEl = parent.querySelector('[data-tid="message-author-name"], span[role="heading"]');
-          if (authorEl) author = authorEl.innerText.trim();
+        const isMe = String(body.className || '').includes('ChatMyMessage');
+
+        // --- Autorenname (Spec-Befund 4) ---
+        // ROOT-CAUSE (Live-Befund 09.10.2026, Chat "Eilers, Birgit"): das Body-Element
+        // [data-tid="chat-pane-message"] traegt SELBST role="group". Die bisherige Logik
+        //   body.closest('[role="group"], ...')   -> lieferte deshalb das BODY-Element
+        //   parent.querySelector('[data-tid="message-author-name"]')  -> blieb im Body.
+        // Eigene Nachrichten tragen den Namen inline im Body (funktionierte nur zufaellig),
+        // bei FREMDEN Nachrichten liegt der Header aber als Geschwister VOR dem Body im
+        // .fui-ChatMessage-Wrapper -> nie gefunden -> "Unbekannt".
+        // Fix: eskalierende Suche Body -> Vorfahren, begrenzt an der Nachrichtengrenze
+        // [data-tid="chat-pane-item"] (darueber hiinaus wuerde der Autor der NEXT-Meldung
+        // gefunden). Reihenfolge: (1) inline im Body, (2) Vorfahren, (3) Geschwister-Notfall.
+        const AUTHOR_SEL = '[data-tid="message-author-name"], [data-tid*="author-name" i], [class*="ChatMessage__author" i]';
+        const readAuthor = (el) => {
+          if (!el) return '';
+          const t = String(el.innerText || '').replace(/\s+/g, ' ').trim();
+          return t ? t.slice(0, 80) : '';
+        };
+
+        let author = readAuthor(body.querySelector(AUTHOR_SEL));
+
+        if (!author) {
+          let anc = body.parentElement;
+          for (let i = 0; i < 6 && anc && !author; i++) {
+            author = readAuthor(anc.querySelector(AUTHOR_SEL));
+            if (anc.getAttribute('data-tid') === 'chat-pane-item') break; // Nachrichtengrenze
+            anc = anc.parentElement;
+          }
         }
 
         if (!author) {
           let prev = body.previousElementSibling;
           while (prev && !author) {
-            const a = prev.querySelector?.('[data-tid="message-author-name"]') || (prev.getAttribute?.('data-tid') === 'message-author-name' ? prev : null);
-            if (a) author = a.innerText.trim();
+            const a = prev.querySelector?.(AUTHOR_SEL) || (prev.getAttribute?.('data-tid') === 'message-author-name' ? prev : null);
+            if (a) { author = readAuthor(a); if (author) break; }
             prev = prev.previousElementSibling;
           }
         }
 
-        const isMe = body.className.includes('ChatMyMessage') || body.className.includes('fui-ChatMyMessage');
-        if (!author && isMe) {
-          author = selfName;
-        }
+        // Eigenes Konto: Anzeigename aus dem DOM hat Vorrang (echter Name statt "Ich"),
+        // selfName bleibt der Fallback, wenn das DOM nichts hergibt.
+        if (!author && isMe) author = selfName;
 
         // Reaktionen sind reine UI-Elemente und gehoeren NICHT in den Nachrichten-Text.
         // Live-Befund 08.10.2026: bei 1:1-Chats liegt der Reaktions-Container INNERHALB
@@ -337,6 +360,7 @@ export class TeamsClient {
 
         msgs.push({
           author: author || 'Unbekannt',
+          isOwn: isMe || undefined,
           html: html,
           text: text,
           mid: mid || undefined,
@@ -458,6 +482,7 @@ export class TeamsClient {
       content = appendRowMedia(i, content);
       return {
         author: m.author,
+        isOwn: m.isOwn || false,
         content,
         mid: m.mid,
         timestamp: m.timestamp,
