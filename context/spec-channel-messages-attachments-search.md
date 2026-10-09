@@ -2,6 +2,25 @@
 
 **Auslöser:** Aktenplan-Harvest 01.10.2026 (DL26-00555). Der Teams-Harvest via `tim` deckte Gruppen-/1:1-Chats vollständig ab, scheiterte aber an 4 dokumentierten Lücken. Diese Spec beschreibt die Fixes. Ziel: Der nächste Harvest kann ALLES automatisch ziehen.
 
+## Stand der Umsetzung (aktualisiert 09.10.2026)
+
+| Befund | Status | Commit |
+|---|---|---|
+| 1 — Kanal-Nachrichten (Baustein A) | ✅ erledigt (01.10.) | `f9d68e1`, `e2da02a` |
+| 2 — `teams_search` 0 Treffer (Baustein C) | ✅ erledigt (09.10.) | `fdca916` |
+| 3 — Anhänge nicht herunterladbar (Baustein B) | ✅ erledigt (01.10.) | `f9d68e1`, `a59e010` |
+| 4 — Autor-Auflösung defekt (Baustein C) | ✅ erledigt (09.10.) | `14c314a` |
+| 5 — Chatlisten-Pagination (Baustein C) | ⬜ **offen** — „See more" wird weiterhin nur herausgefiltert, nicht geklickt; `getFilteredChatRows` liefert nur das geladene Fenster | — |
+
+**Nachträge 08.–09.10.2026 (über die Spec hinaus):**
+
+- **Message Reactions** (`81a8e63`, korrigiert `ade65af`): `teams_get_messages`/`teams_get_channel_messages` liefern je Nachricht `reactions: [{ type, emoji, custom, count, byMe, label }]`. Erste Fassung basierte auf Fehlannahmen (aria-label, CounterBadge, Emoji-Text) und wurde nach Live-DOM-Analyse korrigiert — die Pill nutzt `aria-labelledby="message-<type>-<mid>"`, die Zahl steht im Label-Text, das Emoji in `img[alt]`/`img[itemid]`.
+- **Reaktions-Emoji-Leak** (`b0cf2e6`): bei 1:1-Chats liegt der Reaktions-Container INNERHALB des Text-Bodys → Emoji landeten als `![✅](…)` im Markdown. Reaktions-Chrome wird vor der Markdown-Wandlung via `isReactionArtifact()` entfernt.
+- **Kanal-Zeitstempel ISO** (`4076553`): Subheader liefert nur „6/23 4:44 PM" ohne Jahr → `parseChannelDateTime()` mit Jahres-Ableitung (Anker: vorherige Nachricht bzw. Plausibilität gegen „jetzt", Wochentage, Relativtage, nur-Uhrzeit = heute).
+- **Live-Abnahme Freigabe-Workflow**: Birgit Eilers erteilt formale Freigaben ausschließlich per ✅-Reaction (`type=2705_whiteheavycheckmark`, `byMe=false`) auf Nachrichten, die nur die DL-Nummer enthalten. Bestätigt im Chat „Eilers, Birgit" (DL26-02817, DL25-08496, DL23-10443, DL23-05855, DL26-04047, DL25-07719).
+
+**Lessons (für künftige DOM-Arbeit):** Teams-Web (Fluent UI) verlässt sich auf `aria-labelledby`-Ids, `data-tid`-Familien und `itemid` — NIEMALS `aria-label`/Anzeigetext/CounterBadge raten. Wenn ein Element selbst die Rolle trägt, nach der gesucht wird (`role="group"` am Message-Body), hebt `closest()` auf sich selbst zurück und die Suche bleibt im falschen Subtree. Suchergebnisse sind RELEVANZ-sortiert — chronologische Anker (aufsteigende Jahres-Ableitung) dürfen dort nicht angewendet werden.
+
 **Architektur-Kontext:** teams-mcp ist eine Playwright-Bridge gegen das echte Teams-Web-UI (kein Graph-API). Alle Fixes sind DOM-Scraping-Erweiterungen in `src/teamsClient.js` (+ ggf. `browserManager.js`). Es existieren bereits eingeloggte Browser-Profile pro Tenant (`.teams-browser-profile-<tenant>`), inkl. `dvelop`/`d-velop`.
 
 ## Befunde vom 01.10.2026 (Evidenz)
