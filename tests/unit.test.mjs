@@ -13,6 +13,7 @@ import {
   ensureMediaDir,
   collectAttachmentsFromRow,
   collectReactionsFromRow,
+  isReactionArtifact,
   extractFilenameFromText,
   normalizeExtensionWhitelist,
   extensionAllowed,
@@ -1210,6 +1211,42 @@ describe('Baustein B - Extension-Whitelist & Download-Helfer', () => {
     const weird = nextAvailablePath(dir, 'a/b:c*.pptx');
     assert.ok(!weird.includes('/b:') || path.basename(weird).indexOf(':') === -1);
     assert.ok(fs.existsSync(path.dirname(weird)));
+  });
+});
+
+describe('Baustein D - isReactionArtifact (Reaktions-Chrome aus dem Nachrichten-Text filtern)', () => {
+  test('erkennt den Reaktions-Container (.fui-ChatMessage__reactions)', () => {
+    assert.equal(isReactionArtifact({ className: 'fui-ChatMessage__reactions ___lhb81o0 f10pi13n' }), true);
+  });
+
+  test('erkennt Reaction-Summary-Toolbar und Pill-Button', () => {
+    assert.equal(isReactionArtifact({ dataTid: 'diverse-reaction-summary' }), true);
+    assert.equal(isReactionArtifact({ dataTid: 'diverse-reaction-pill-button' }), true);
+    assert.equal(isReactionArtifact({ className: 'fui-Button diverse-reaction-pill-checked', dataTid: 'diverse-reaction-pill-button' }), true);
+  });
+
+  test('erkennt den Plus-/Picker-Button (KEINE Reaktion)', () => {
+    assert.equal(isReactionArtifact({ dataTid: 'add-reaction-picker-entry-point-button' }), true);
+    assert.equal(isReactionArtifact({ dataTid: 'add-reaction-picker-entry-point-icon' }), true);
+  });
+
+  test('erkennt reactions-summary-item-renderer', () => {
+    assert.equal(isReactionArtifact({ dataTid: 'reactions-summary-item-renderer' }), true);
+  });
+
+  test('echte Nachrichten-Elemente werden NICHT als Artefakt markiert', () => {
+    assert.equal(isReactionArtifact({ className: 'fui-ChatMessage__body r1ym62ll', dataTid: 'chat-pane-message' }), false);
+    assert.equal(isReactionArtifact({ className: 'fui-ChatMyMessage__body' }), false);
+    assert.equal(isReactionArtifact({ dataTid: 'message-body' }), false);
+    assert.equal(isReactionArtifact({ dataTid: 'emoticon-renderer' }), false); // Renderer innerhalb eines Pill-Buttons
+    assert.equal(isReactionArtifact({ dataTid: 'message-actions-menu-hidden-button' }), false);
+  });
+
+  test('robust gegen leere/fehlende Eingaben', () => {
+    assert.equal(isReactionArtifact(), false);
+    assert.equal(isReactionArtifact({}), false);
+    assert.equal(isReactionArtifact({ className: null, dataTid: null }), false);
+    assert.equal(isReactionArtifact({ className: '', dataTid: '' }), false);
   });
 });
 

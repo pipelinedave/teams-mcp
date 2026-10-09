@@ -214,6 +214,7 @@ export class TeamsClient {
       const toIso = new Function('return (' + helpers.toIso + ')')();
       const collectAttachments = new Function('return (' + helpers.collectAttachments + ')')();
       const collectReactions = new Function('return (' + helpers.collectReactions + ')')();
+      const isReactionArtifact = new Function('return (' + helpers.isReactionArtifact + ')')();
       const msgs = [];
       // Chat-DOM: chat-pane-message / fui-ChatMessage__body. Kanal-DOM (neues Teams-Web,
       // Befund 01.10.2026): channel-pane-message-Rows mit message-body + post-message-subheader.
@@ -248,7 +249,27 @@ export class TeamsClient {
           author = selfName;
         }
 
-        const html = body.innerHTML || '';
+        // Reaktionen sind reine UI-Elemente und gehoeren NICHT in den Nachrichten-Text.
+        // Live-Befund 08.10.2026: bei 1:1-Chats liegt der Reaktions-Container INNERHALB
+        // des [data-tid="chat-pane-message"]-Elements, das zugleich der Text-Body ist
+        // (msgRowFor faellt auf `body` zurueck) -> ohne Filter landet das Emoji als
+        // ![✅](https://...emoticons/2705_whiteheavycheckmark/...) im Markdown.
+        // Deshalb vor der Markdown-Wandlung die Reaktions-Knoten aus einem Klon entfernen.
+        const contentHtml = (() => {
+          try {
+            const clone = body.cloneNode(true);
+            const nodes = clone.querySelectorAll('*') || [];
+            for (const n of nodes) {
+              const cn = typeof n.className === 'string' ? n.className : '';
+              if (isReactionArtifact({ className: cn, dataTid: n.getAttribute('data-tid') })) n.remove();
+            }
+            return clone.innerHTML || '';
+          } catch {
+            return body.innerHTML || '';
+          }
+        })();
+
+        const html = contentHtml;
         const text = body.innerText?.trim() || '';
         if (!text && !html) continue;
 
@@ -396,7 +417,7 @@ export class TeamsClient {
       } catch { /* Blob-Extraktion scheitert nie fatal: Nachrichten bleiben erhalten */ }
 
       return { msgs, blobData, rowBlobUrls };
-    }, { max, selfName: config.selfName, helpers: { toIso: messageTimeToIso.toString(), collectAttachments: collectAttachmentsFromRow.toString(), collectReactions: collectReactionsFromRow.toString() }, blobTimeoutMs: 3000 });
+    }, { max, selfName: config.selfName, helpers: { toIso: messageTimeToIso.toString(), collectAttachments: collectAttachmentsFromRow.toString(), collectReactions: collectReactionsFromRow.toString(), isReactionArtifact: isReactionArtifact.toString() }, blobTimeoutMs: 3000 });
 
     const { msgs, blobData, rowBlobUrls } = messagesData;
 
@@ -1783,6 +1804,20 @@ export function collectAttachmentsFromRow(row) {
 // Checkmark ist je nach Teams-Version/Region ein eigener Slug — die Entscheidung, ob eine
 // Reaktion eine Freigabe ist, trifft der aufrufende Agent anhand von type/emoji/count/byMe.
 // Kein CounterBadge existiert in dieser Struktur (Befund: count kommt NUR aus dem Label-Text).
+// Klassifiziert ein DOM-Element als "Reaktions-Artefakt" (Reaktions-Container/-Pills/
+// Plus-Button) — also UI-Chrome, der NICHT zum Nachrichten-Text gehoert.
+// Reine Funktion ohne Modul-Scope, damit sie via .toString() in page.evaluate
+// serialisierbar und hiermit unit-testbar ist (gleiches Muster wie messageTimeToIso).
+// Live-Befund 08.10.2026: .fui-ChatMessage__reactions liegt innerhalb von
+// [data-tid="chat-pane-message"] und landet sonst als ![✅](...) im Markdown.
+export function isReactionArtifact({ className = '', dataTid = '' } = {}) {
+  const cls = String(className || '').toLowerCase();
+  const tid = String(dataTid || '').toLowerCase();
+  if (cls.includes('reactions')) return true;              // fui-ChatMessage__reactions
+  if (/diverse-reaction|add-reaction-picker|reaction-picker|reactions-summary/.test(tid)) return true;
+  return false;
+}
+
 export function collectReactionsFromRow(row) {
   const out = [];
   if (!row || typeof row.querySelectorAll !== 'function') return out;
