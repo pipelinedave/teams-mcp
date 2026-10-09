@@ -10,7 +10,7 @@
 | 2 — `teams_search` 0 Treffer (Baustein C) | ✅ erledigt (09.10.) | `fdca916` |
 | 3 — Anhänge nicht herunterladbar (Baustein B) | ✅ erledigt (01.10.) | `f9d68e1`, `a59e010` |
 | 4 — Autor-Auflösung defekt (Baustein C) | ✅ erledigt (09.10.) | `14c314a` |
-| 5 — Chatlisten-Pagination (Baustein C) | ⬜ **offen** — „See more" wird weiterhin nur herausgefiltert, nicht geklickt; `getFilteredChatRows` liefert nur das geladene Fenster | — |
+| 5 — Chatlisten-Pagination (Baustein C) | ✅ erledigt (09.10.) | Pagination + Safety-Net (siehe Nachträge) |
 
 **Nachträge 08.–09.10.2026 (über die Spec hinaus):**
 
@@ -18,6 +18,9 @@
 - **Reaktions-Emoji-Leak** (`b0cf2e6`): bei 1:1-Chats liegt der Reaktions-Container INNERHALB des Text-Bodys → Emoji landeten als `![✅](…)` im Markdown. Reaktions-Chrome wird vor der Markdown-Wandlung via `isReactionArtifact()` entfernt.
 - **Kanal-Zeitstempel ISO** (`4076553`): Subheader liefert nur „6/23 4:44 PM" ohne Jahr → `parseChannelDateTime()` mit Jahres-Ableitung (Anker: vorherige Nachricht bzw. Plausibilität gegen „jetzt", Wochentage, Relativtage, nur-Uhrzeit = heute).
 - **Live-Abnahme Freigabe-Workflow**: Birgit Eilers erteilt formale Freigaben ausschließlich per ✅-Reaction (`type=2705_whiteheavycheckmark`, `byMe=false`) auf Nachrichten, die nur die DL-Nummer enthalten. Bestätigt im Chat „Eilers, Birgit" (DL26-02817, DL25-08496, DL23-10443, DL23-05855, DL26-04047, DL25-07719).
+- **Chatlisten-Pagination** (09.10., Befund 5): `getFilteredChatRows` lädt die Liste jetzt vollständig nach — `expandChatList` klickt den Paginator (`data-fui-tree-item-value="…RecentChats-load-next-page"`, Text-Fallback „See more"/„Mehr anzeigen") bis zur Stabilisierung. Live: 32 → **106** verfügbare Chats (d-velop); Zweitausführung ohne Re-Expand (2,6s statt 9,3s, Paginator ist weg). `listChats` liefert `totalAvailable`. „See all your teams" wird bewusst NICHT geklickt (andere Sektion).
+- **getMessages-Safety-Net** (09.10.): In der vollständigen Liste stehen auch Nicht-Chat-Entries („AC" aus der Communities-Sektion) — Klick darauf öffnet keinen Chat, und ohne Prüfung wurde still der FALSCHE Verlauf gescrappt (das alte chat_index-Problem, Befund 1). `getMessages` verifiziert jetzt wie `sendMessage` Ziel ↔ geöffneter Chat und wirft bei Mismatch. 1:1-Chats aus dem hinteren Bereich resolven verifiziert über `chat_index` **und** `chat_name` („Gawe, Mario (d.velop Extern)", Index 94/106).
+- **Titel-Normalisierung** (09.10.): Unbenannte Gruppen-Chats zeigen im Pane-Header die Mitglieder UNTEREINANDER („Borgmann, Katharina\nWobring, Lena") — `getActiveChatTitle` fasst das zu einer Zeile („…, …") zusammen; `res.chat` ist damit agentenlesbar. Listenformat („…, +2") und Header-Vollformat bleiben unterschiedliche Teams-Ansichten desselben Chats — der Safety-Net akzeptiert das via Token-Match.
 
 **Lessons (für künftige DOM-Arbeit):** Teams-Web (Fluent UI) verlässt sich auf `aria-labelledby`-Ids, `data-tid`-Familien und `itemid` — NIEMALS `aria-label`/Anzeigetext/CounterBadge raten. Wenn ein Element selbst die Rolle trägt, nach der gesucht wird (`role="group"` am Message-Body), hebt `closest()` auf sich selbst zurück und die Suche bleibt im falschen Subtree. Suchergebnisse sind RELEVANZ-sortiert — chronologische Anker (aufsteigende Jahres-Ableitung) dürfen dort nicht angewendet werden.
 

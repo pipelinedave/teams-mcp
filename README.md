@@ -72,8 +72,12 @@ und Nachrichten senden – jeweils in einem isolierten Browser-Profil pro Konto/
   Markdown erscheint statt der unbrauchbaren `blob:`-URL ein lokaler `file://`-Pfad, den
   multimodale Agenten direkt laden können. Flüchtige UI-Icons (Buttons/Avatare/Reaktionen)
   werden dabei bewusst ignoriert.
-- **Konsistente Chat- & Adressbuch-Auflösung**: `chat_index` und `chat_name` lösen auf
-  bestehende Chats auf. Ist ein Kollege noch nicht in der Chat-Liste, startet `teams_send_message`
+- **Konsistente Chat- & Adressbuch-Auflösung**: `chat_index` und `chat_name` lösen auf die
+  **vollständige** Chatliste auf — die Liste wird vor der Auflösung automatisch nachgeladen
+  (Paginator-Klicks bis zur Stabilisierung, `listChats` meldet `totalAvailable`).
+  `getMessages` verifiziert nach dem Öffnen (Sicherheitsnetz), dass der geöffnete Chat dem
+  Ziel entspricht — bei Nicht-Chat-Einträgen gibt es einen klaren Fehler statt stiller
+  Fehlresolvenz. Ist ein Kollege noch nicht in der Chat-Liste, startet `teams_send_message`
   vollautomatisch einen neuen Chat über das globale Unternehmensadressbuch (GAL / People-Picker).
 - **Sichere Sendesemantik**: `teams_send_message` sendet nicht blind in den aktiven
   Chat, wenn der Ziel-Chat nicht eindeutig gefunden wird – es wirft stattdessen einen Fehler.

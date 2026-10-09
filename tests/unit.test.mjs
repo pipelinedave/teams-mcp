@@ -8,6 +8,7 @@ import {
   messageTimeToIso,
   parseChannelDateTime,
   searchExtractResults,
+  isChatListLoadMoreEntry,
   mimeToExt,
   sanitizeFilename,
   saveBlobDataUrl,
@@ -1541,6 +1542,33 @@ describe('Baustein E - searchExtractResults (Teams-Suchergebnisse, Spec-Befund 2
       try { return searchExtractResults({ max: 10 }); } finally { delete global.document; }
     })();
     assert.deepEqual(items, []);
+  });
+});
+
+describe('Baustein F - isChatListLoadMoreEntry (Chatlisten-Paginator, Spec-Befund 5)', () => {
+  test('System-Identifier (data-fui-tree-item-value) matcht', () => {
+    assert.equal(isChatListLoadMoreEntry({ treeItemValue: 'OneGQL_SystemDefinedConversationFolder|x~RecentChats-load-next-page' }), true);
+  });
+
+  test('Text-Fallback EN + DE (exakt, nicht praefix-basiert)', () => {
+    assert.equal(isChatListLoadMoreEntry({ firstLine: 'See more' }), true);
+    assert.equal(isChatListLoadMoreEntry({ firstLine: 'see more' }), true);
+    assert.equal(isChatListLoadMoreEntry({ firstLine: 'Mehr anzeigen' }), true);
+    assert.equal(isChatListLoadMoreEntry({ firstLine: 'mehr anzeigen' }), true);
+  });
+
+  test('"See all your teams"/"See all channels" matchen NICHT (andere Sektion!)', () => {
+    assert.equal(isChatListLoadMoreEntry({ treeItemValue: 'fuiTreeItemValue-r7r', firstLine: 'See all your teams' }), false);
+    assert.equal(isChatListLoadMoreEntry({ firstLine: 'See all channels' }), false);
+    assert.equal(isChatListLoadMoreEntry({ firstLine: 'See all your teams' }), false);
+  });
+
+  test('echte Chats und leere Eingaben matchen nicht', () => {
+    assert.equal(isChatListLoadMoreEntry({ firstLine: 'Gesamt-JF Aktenplanmigration' }), false);
+    assert.equal(isChatListLoadMoreEntry({ firstLine: 'Eilers, Birgit' }), false);
+    assert.equal(isChatListLoadMoreEntry({ treeItemValue: 'fuiTreeItemValue-abc' }), false);
+    assert.equal(isChatListLoadMoreEntry({}), false);
+    assert.equal(isChatListLoadMoreEntry(), false);
   });
 });
 

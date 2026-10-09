@@ -88,11 +88,65 @@ export class TeamsClient {
     }
   }
 
+  // Laedt die Chatliste vollstaendig nach (Spec-Befund 5): klickt den Chat-Listen-
+  // Paginator ("See more" / "Mehr anzeigen") so lange, bis keine weitere Seite mehr
+  // kommt. Ohne diesen Schritt resolven chat_index/chat_name nur ueber das initial
+  // geladene Fenster (~25-40 Eintraege) — Chats dahinter waren unerreichbar.
+  //
+  // Live-Befund 09.10.2026 (d-velop): der Paginator ist ein div[role="treeitem"] mit
+  // data-fui-tree-item-value="...RecentChats-load-next-page" (System-Identifier,
+  // sprachunabhaengig — robuster als Text-Matching). Jeder Klick laedt ~25 weitere
+  // Eintraege (43 -> 68 -> 93 -> 116 Treeitems); danach verschwindet der Paginator.
+  // WICHTIG: "See all your teams" ist ein ANDERER Paginator (Teams-Sektion, value
+  // "fuiTreeItemValue-*") — er wird bewusst NICHT geklickt.
+  // Abbruch: Paginator weg ODER 2 identisch lange Scans hintereinander (Klick wirkte
+  // nicht) ODER maxRounds erreicht.
+  async expandChatList(page, { maxRounds = 12, settleMs = 1800 } = {}) {
+    const check = isChatListLoadMoreEntry.toString();
+    for (let round = 0; round < maxRounds; round++) {
+      const state = await page.evaluate((checkFn) => {
+        const isLoadMore = new Function('return (' + checkFn + ')')();
+        const rows = Array.from(document.querySelectorAll('[role="treeitem"]'));
+        let paginator = null;
+        for (const r of rows) {
+          if (isLoadMore({
+            treeItemValue: r.getAttribute('data-fui-tree-item-value') || '',
+            firstLine: ((r.innerText || '').trim().split('\n')[0] || '').trim()
+          })) { paginator = r; break; }
+        }
+        return { total: rows.length, hasPaginator: !!paginator };
+      }, check).catch(() => ({ total: -1, hasPaginator: false }));
+
+      if (!state.hasPaginator) return true;        // Liste vollstaendig geladen
+      if (state.total < 0) return false;           // Evaluate fehlgeschlagen
+
+      const handle = await page.evaluateHandle((checkFn) => {
+        const isLoadMore = new Function('return (' + checkFn + ')')();
+        const rows = Array.from(document.querySelectorAll('[role="treeitem"]'));
+        return rows.find((r) => isLoadMore({
+          treeItemValue: r.getAttribute('data-fui-tree-item-value') || '',
+          firstLine: ((r.innerText || '').trim().split('\n')[0] || '').trim()
+        })) || null;
+      }, check);
+      const el = handle.asElement();
+      if (!el) return true;                        // Paginator zwischenzeitlich verschwunden
+      await el.scrollIntoViewIfNeeded().catch(() => {});
+      await el.click().catch(async () => { await el.click({ force: true }).catch(() => null); });
+      await page.waitForTimeout(settleMs);
+    }
+    return false;                                  // maxRounds erreicht (Liste evtl. weiter laufend)
+  }
+
   // Liefert die gefilterte Liste der Chat-Treeitems (gleiche Logik wie listChats),
   // damit chat_index- und chat_name-Lookups konsistent auf denselben Items arbeiten.
-  async getFilteredChatRows(page) {
+  // Standardmaessig wird zunaechst die Liste vollstaendig nachgeladen (expandChatList),
+  // damit auch Chats jenseits des initialen Fensters addressierbar sind.
+  async getFilteredChatRows(page, { expand = true } = {}) {
     await this.openChatView(page);
     await page.waitForSelector('[role="treeitem"]', { timeout: 15000 }).catch(() => null);
+    if (expand) {
+      await this.expandChatList(page).catch(() => null);
+    }
     const rows = await page.$$('[role="treeitem"]');
 
     const filtered = [];
@@ -166,12 +220,16 @@ export class TeamsClient {
     return {
       tenant: t,
       count: chats.length,
+      totalAvailable: filtered.length,
       chats: chats
     };
   }
 
   // Liefert den Titel des aktuell geöffneten Chats. Bevorzugt den Chat-Pane-Header
   // aus dem DOM (stabil, z.B. [data-tid="chat-title"]), fällt auf page.title() zurück.
+  // Mehrzeilige Header (unbenannte Gruppen-Chats zeigen Mitglieder UNTEREINANDER,
+  // Live-Befund 09.10.2026: "Borgmann, Katharina\nWobring, Lena") werden zu einer
+  // Zeile mit ", " zusammengefasst — sonst ist res.chat fuer Agenten unlesbar.
   async getActiveChatTitle(page) {
     try {
       const domTitle = await page.evaluate(() => {
@@ -194,7 +252,7 @@ export class TeamsClient {
         }
         return null;
       });
-      if (domTitle) return domTitle;
+      if (domTitle) return domTitle.replace(/\s*\n\s*/g, ', ');
     } catch (e) {}
 
     // Fallback: page.title() -> "Chat | David Hallmann (You) | Microsoft Teams"
@@ -519,8 +577,9 @@ export class TeamsClient {
       throw new Error("Keine Chats in Teams gefunden.");
     }
 
+    let picked = null;
     if (typeof chatIndex === 'number' || chatName) {
-      const picked = this.pickChatRow(filtered, chatName, chatIndex);
+      picked = this.pickChatRow(filtered, chatName, chatIndex);
       if (picked) {
         await picked.row.click();
         await page.waitForTimeout(2500);
@@ -530,6 +589,22 @@ export class TeamsClient {
     // Aktiven Chat-Titel aus dem Message-Pane verifizieren (stabil)
     const activeChat = await this.getActiveChatTitle(page);
     await page.waitForSelector('[data-tid="chat-pane-message"], [data-tid="message-body"], .fui-ChatMessage__body, .fui-ChatMyMessage__body', { timeout: 15000 }).catch(() => null);
+
+    // Sicherheitsnetz (Live-Befund 09.10.2026): Bei der nun vollstaendigen Chatliste
+    // stehen auch Nicht-Chat-Entries in der gefilterten Liste (z.B. "AC" aus der
+    // Communities-Sektion). Ein Klick darauf oeffnet KEINEN Chat — Teams bleibt im
+    // aktiven Chat, und ohne Pruefung wuerde still der FALSCHE Verlauf gescrappt
+    // (das alte Silent-Fehlresolvenz-Problem von chat_index, Spec-Befund 1).
+    // sendMessage hat dieses Netz bereits — hier zieht es getMessages nach.
+    if (picked) {
+      const targetNorm = String(picked.title || '').toLowerCase().replace(/\s*\(you\)$/i, '').trim();
+      const activeNorm = String(activeChat || '').toLowerCase().replace(/\s*\(you\)$/i, '').trim();
+      const nameParts = targetNorm.split(/\s+/).filter((p) => p.length >= 2);
+      const matchAny = nameParts.some((p) => activeNorm.includes(p));
+      if (!activeNorm.includes(targetNorm) && !targetNorm.includes(activeNorm) && !matchAny) {
+        throw new Error(`Sicherheitsnetz: Der geöffnete Chat '${activeChat}' stimmt nicht mit dem Ziel '${picked.title}' überein. Es wurden KEINE Nachrichten des Ziel-Chats gelesen. (Der Eintrag ist vermutlich kein klickbarer Chat — pruefe die vollständige Liste via teams_list_chats mit hoeherem limit.)`);
+      }
+    }
 
     const messages = await this._scrapeMessages(page, {
       max: limit,
@@ -2124,6 +2199,22 @@ export function isReactionArtifact({ className = '', dataTid = '' } = {}) {
   if (cls.includes('reactions')) return true;              // fui-ChatMessage__reactions
   if (/diverse-reaction|add-reaction-picker|reaction-picker|reactions-summary/.test(tid)) return true;
   return false;
+}
+
+// Erkennt den Chat-Listen-Paginator ("See more" / "Mehr anzeigen") an einem
+// [role="treeitem"] — pure und via .toString() in page.evaluate serialisierbar.
+//
+// Live-Befund 09.10.2026 (d-velop): der verlaesslichste Anker ist der System-
+// Identifier data-fui-tree-item-value="...RecentChats-load-next-page" (sprach-
+// unabhaengig). Text-Fallback deckt aeltere UI-Varianten ab (EN + DE).
+// WICHTIG: "See all your teams" / "See all channels" sind ANDERE Paginator
+// (Teams-Sektion) und duerfen hier NICHT matchen — sonst navigiert die Expansion
+// aus der Chat-Rail heraus.
+export function isChatListLoadMoreEntry({ treeItemValue = '', firstLine = '' } = {}) {
+  const value = String(treeItemValue || '').toLowerCase();
+  if (value.includes('load-next-page')) return true;
+  const t = String(firstLine || '').trim().toLowerCase();
+  return t === 'see more' || t === 'mehr anzeigen';
 }
 
 export function collectReactionsFromRow(row) {
