@@ -209,6 +209,44 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         }
       },
       {
+        name: 'teams_fetch',
+        description: 'Lädt eine beliebige http(s)-URL im authentifizierten Browser-Kontext des Tenants (teilt den SSO-Cookie-Jar mit Teams-Web — SharePoint/OneDrive ohne CORS) und speichert sie als Datei (mode="file", Ziel TEAMS_MCP_DOWNLOAD_DIR, Standard ~/.teams-downloads) oder liefert den Seiteninhalt zurück (mode="text" = bereinigter Text, mode="html" = rohes HTML, z.B. zum Extrahieren von Link-hrefs). Auth-, HTML- und Größenwächter eingebaut; SharePoint-File-Links brauchen meist ein angehängtes "?download=1" bzw. "&download=1".',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tenant: tenantParam(),
+            url: {
+              type: 'string',
+              description: 'Abzurufende http(s)-URL (z.B. SharePoint-Datei-Link)'
+            },
+            mode: {
+              type: 'string',
+              enum: ['file', 'text', 'html'],
+              description: 'file = als Datei speichern (Standard), text = bereinigter Seitentext, html = rohes HTML-Stück',
+              default: 'file'
+            },
+            filename: {
+              type: 'string',
+              description: 'Zieldateiname (nur mode=file; sonst aus der URL abgeleitet)'
+            },
+            max_bytes: {
+              type: 'number',
+              description: 'Maximalgröße in Bytes für mode=file (Standard: 300 MB; bei Überschreitung wird bewusst NICHT gespeichert)'
+            },
+            max_chars: {
+              type: 'number',
+              description: 'Maximale Länge für text/html-Rückgabe (Standard: 20000)'
+            },
+            warmup: {
+              type: 'boolean',
+              description: 'Vor dem Abruf eine Wegwerf-Seite auf der URL-Origin öffnen, damit SSO-Redirects die Cookies im Jar setzen (empfohlen beim Erstkontakt einer SharePoint-Domain)',
+              default: false
+            }
+          },
+          required: ['url']
+        }
+      },
+      {
         name: 'teams_send_message',
         description: 'Sendet eine Nachricht in einen Microsoft Teams Chat (optional inklusive Dateianhängen).',
         inputSchema: {
@@ -591,6 +629,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'teams_mark_delivered': {
         // Delegiert an die pure Steuerlogik markDeliveredControl (reportDelivery.js).
         const res = markDeliveredControl(args?.file);
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+
+      case 'teams_fetch': {
+        const res = await teamsClient.fetchUrl(resolveTenant(args?.tenant), {
+          url: args?.url,
+          mode: args?.mode || 'file',
+          filename: args?.filename,
+          maxBytes: args?.max_bytes,
+          maxChars: args?.max_chars,
+          warmup: !!args?.warmup,
+          timeoutMs: 60000
+        });
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       }
 

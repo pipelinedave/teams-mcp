@@ -333,6 +333,109 @@ export class TeamsClient {
     }
   }
 
+  // Laedt eine beliebige http(s)-URL im authentifizierten Browser-Kontext des Tenants.
+  // Playwright APIRequestContext teilt den Cookie-Jar mit Teams-Web (SSO-Cookies von
+  // login.microsoftonline sowie SharePoint/OneDrive) und hat KEINE CORS-Beschraenkung.
+  // Use-Case (12.10.2026): SharePoint-Files (z.B. moveAI-Dokumente auf
+  // o365adessogroup.sharepoint.com), die NICHT als Chat-Anhang geteilt wurden und
+  // deshalb per getMessages/downloadMessageAttachments unerreichbar sind.
+  // mode='file': speichert im Download-Dir (config.getDownloadDir()).
+  // mode='text': liefert bereinigten Seitentext (Auth-/Inhalts-Checks).
+  // mode='html': liefert rohes HTML-Stueck (z.B. um Link-hrefs aus Bibliothekslisten
+  //              zu extrahieren — Text-Mode haette die hrefs weggestrippt).
+  // warmup=true: oeffnet zuerst eine Wegwerf-Seite auf der URL-Origin, damit der
+  //              SSO-Redirect die Cookies im Jar setzt (erstkontakt SharePoint).
+  async fetchUrl(tenant = '', { url, mode = 'file', filename, maxBytes = 300 * 1024 * 1024, maxChars = 20000, warmup = false, timeoutMs = 60000 } = {}) {
+    if (!url || !/^https?:\/\//i.test(url)) {
+      throw new Error("Bitte eine gueltige http(s)-URL uebergeben (z.B. SharePoint-File-Link).");
+    }
+    const t = browserManager.normalizeTenant(tenant);
+    const page = await this.getPage(t, true);
+    const context = page.context();
+
+    if (warmup) {
+      const origin = new URL(url).origin;
+      const tmp = await context.newPage();
+      try {
+        await tmp.goto(origin, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await tmp.waitForTimeout(2500); // SSO-Redirects durchlaufen lassen
+      } catch (e) {
+        // Origin nicht erreichbar -> trotzdem weiter; Auth-Waechter unten greift
+      } finally {
+        await tmp.close().catch(() => {});
+      }
+    }
+
+    const resp = await context.request.get(url, { timeout: timeoutMs, maxRedirects: 10 });
+    const finalUrl = resp.url();
+    const status = resp.status();
+    const contentType = String(resp.headers()['content-type'] || '').toLowerCase();
+
+    // Auth-Waechter: SSO-Loginseite oder 401/403 -> nichts speichern
+    const looksLogin = /login\.(microsoftonline|live)\.com|\/signin|\/_login\//i.test(finalUrl);
+    if (status === 401 || status === 403 || looksLogin) {
+      return {
+        ok: false, reason: 'auth', status, contentType, finalUrl,
+        hint: 'Session/Rechte fehlen fuer diese URL (SSO-Login-Redirect oder 401/403). warmup=true versuchen bzw. Dateiberechtigungen pruefen.'
+      };
+    }
+
+    if (mode === 'text' || mode === 'html') {
+      const html = (await resp.text()).slice(0, maxChars * 6);
+      if (mode === 'html') {
+        return { ok: true, mode: 'html', status, contentType, finalUrl, html: html.slice(0, maxChars), truncated: html.length > maxChars };
+      }
+      const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+      const text = html
+        .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return {
+        ok: true, mode: 'text', status, contentType, finalUrl,
+        title: titleMatch ? titleMatch[1].trim() : undefined,
+        text: text.slice(0, maxChars),
+        truncated: text.length > maxChars
+      };
+    }
+
+    // mode='file'
+    const isHtml = contentType.includes('text/html');
+    if (isHtml) {
+      const bodyHead = (await resp.text()).slice(0, 300).replace(/\s+/g, ' ');
+      return {
+        ok: false, reason: 'html-page', status, contentType, finalUrl, bodyHead,
+        hint: 'URL liefert eine HTML-Seite statt eines Downloads. Bei SharePoint-File-Links "?download=1" bzw. "&download=1" anhaengen.'
+      };
+    }
+
+    const contentLength = Number(resp.headers()['content-length'] || 0);
+    if (contentLength > maxBytes) {
+      return { ok: false, reason: 'too-large', status, contentType, finalUrl, contentLength, maxBytes };
+    }
+    const buf = await resp.body();
+    if (buf.length > maxBytes) {
+      return { ok: false, reason: 'too-large', status, contentType, finalUrl, bytes: buf.length, maxBytes };
+    }
+
+    const dir = (config && typeof config.getDownloadDir === 'function')
+      ? config.getDownloadDir()
+      : (process.env.TEAMS_MCP_DOWNLOAD_DIR || path.join(process.env.HOME || '/tmp', '.teams-downloads'));
+    fs.mkdirSync(dir, { recursive: true });
+    let name = filename;
+    if (!name) {
+      try {
+        name = decodeURIComponent(new URL(finalUrl).pathname.split('/').pop() || '');
+      } catch (e) { name = ''; }
+      name = (name || 'fetch-download').split('?')[0].replace(/[\\/:*?"<>|]/g, '_');
+    }
+    const target = path.join(dir, name);
+    fs.writeFileSync(target, buf);
+    return { ok: true, mode: 'file', status, contentType, finalUrl, bytes: buf.length, path: target };
+  }
+
   // Gemeinsamer Message-Scraper für Chats UND Kanäle (Baustein A/B): extrahiert die
   // im Message-Pane sichtbaren Nachrichten (Autor, Zeitstempel, Text, Medien, Anhänge).
   // Die Blob-Medien werden im Browser zu dataURLs aufgelöst und anschließend in Node
