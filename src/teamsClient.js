@@ -81,10 +81,37 @@ export class TeamsClient {
   }
 
   async openChatView(page) {
+    await this.exitSearchView(page);
     const chatBtn = await page.$('button[data-tid="app-bar-chat"], button[aria-label*="Chat"], a[aria-label*="Chat"]');
     if (chatBtn) {
       await chatBtn.click().catch(() => null);
       await page.waitForTimeout(2000);
+    }
+  }
+
+  // Verlaesst eine haengende Search-Ansicht (nach teams_search). In dieser ist die
+  // linke Chat-Rail — und damit der Team-/Kanal-Baum — NICHT gerendert: Folge-Aufrufe
+  // von teams_get_channel_messages schlugen mit "Team wurde im Teams-Baum nicht
+  // gefunden. Sichtbare Eintraege: (keine)" fehl (Live-Harvest 12.10.2026, Repro:
+  // search -> direkt get_channel_messages). Ein Klick auf die Chat-App in der App-Bar
+  // stellt die Rail wieder her; danach ist der Baum wieder scannbar.
+  async exitSearchView(page) {
+    try {
+      const inSearch = await page.evaluate(() =>
+        !!document.querySelector('[data-tid="search-content"], [data-tid="search-all-page-outer"]') ||
+        /search\s*\|/i.test(document.title || ''));
+      if (!inSearch) return false;
+      const chatBtn = await page.$('button[data-tid="app-bar-chat"], button[aria-label*="Chat" i], a[aria-label*="Chat" i]');
+      if (chatBtn) {
+        await chatBtn.click().catch(() => null);
+        await page.waitForTimeout(1500);
+        return true;
+      }
+      await page.keyboard.press('Escape').catch(() => null);
+      await page.waitForTimeout(800);
+      return true;
+    } catch (e) {
+      return false;
     }
   }
 
@@ -733,6 +760,7 @@ export class TeamsClient {
   // (a) Neues Teams-Web: "Teams and channels"-Sektion in der Chat-Rail — ggf. aufklappen.
   // (b) Ältere UI: eigenes App-Bar-Icon (data-tid="app-bar-teams") — darauf klicken.
   async openTeamsView(page) {
+    await this.exitSearchView(page);
     const teamsButton = await page.$('[data-tid="app-bar-teams"], button[aria-label="Teams"], a[aria-label="Teams"]');
     if (teamsButton) {
       await teamsButton.click().catch(() => null);
@@ -1867,6 +1895,24 @@ export function parseChannelDateTime(raw, opts = {}) {
     return isNaN(base.getTime()) ? null : base.toISOString();
   }
 
+  // 6) Relative Vergangenheit ("21 days ago", "2 hours ago", DE "vor 21 Tagen") —
+  //    File-Suchtreffer (serp-file-preview-summary). Eindeutig vergangenheitsbezogen,
+  //    daher sicher zu ISO aufloesbar (Live-Harvest 12.10.2026).
+  m = /^(a|an|einem?|einer?|\d+)\s+(second|minute|hour|day|week|month)s?\s+ago$/i.exec(s)
+   || /^vor\s+(einem?|einer?|\d+)\s+(sekunden?|minuten?|stunden?|tagen?|wochen?|monaten?)$/i.exec(s);
+  if (m) {
+    const numRaw = (m[1] || '').toLowerCase();
+    const n = /^\d+$/.test(numRaw) ? Number(numRaw) : 1;
+    const unit = (m[2] || '').toLowerCase();
+    const ms = /second|sekunde/.test(unit) ? 1000
+      : /minute/.test(unit) ? 60 * 1000
+      : /hour|stunde/.test(unit) ? 3600 * 1000
+      : /day|tag/.test(unit) ? 24 * 3600 * 1000
+      : /week|woche/.test(unit) ? 7 * 24 * 3600 * 1000
+      : 30 * 24 * 3600 * 1000;
+    return new Date(now.getTime() - n * ms).toISOString();
+  }
+
   return null;
 }
 
@@ -1907,9 +1953,57 @@ export function searchExtractResults({ max = 10 } = {}) {
       : childTids.includes('message-app-card-header') || childTids.includes('search-message-card') ? 'message'
       : 'other';
 
+    const allLines = (card.innerText || '').split('\n').map((x) => x.trim()).filter(Boolean);
+
+    // --- Meeting-Karten (Live-Befund 12.10.2026): chat enthielt vorher "13 NOV" ---
+    // (meeting-day/month-Spans landeten in allLines[0]). Titel steckt in
+    // cal-event-details-card-title; bewusst KEIN ISO-Zeitstempel: meeting-day/month
+    // ("23 OCT") zeigt sowohl vergangene als auch zukuenftige Termine, eine
+    // Jahr-Heuristik wuerde hier raten. meetingDate/timeRange bleiben Rohangaben.
+    if (kind === 'meeting') {
+      const titleEl = card.querySelector('[data-tid="cal-event-details-card-title"]');
+      const dayEl = card.querySelector('[data-tid="meeting-day"]');
+      const monthEl = card.querySelector('[data-tid="meeting-month"]');
+      const rec = {
+        kind: 'meeting',
+        chat: (titleEl && clean(titleEl.innerText)) || null,
+        meetingDate: [dayEl && clean(dayEl.innerText), monthEl && clean(monthEl.innerText)].filter(Boolean).join(' ') || null,
+        timeRange: (allLines.find((l) => /\d{1,2}:\d{2}\s*(am|pm)?\s*-\s*\d{1,2}:\d{2}/i.test(l)) || null),
+        preview: clean(card.innerText).slice(0, 300)
+      };
+      const inv = allLines.find((l) => /\binvited\b/i.test(l) || /\beingeladen\b/i.test(l));
+      if (inv) rec.author = clean(inv.replace(/\s*(invited|hat\s+\S+\s+eingeladen).*$/i, '')).slice(0, 80) || null;
+      const key = `meeting|${rec.chat}|${rec.meetingDate}`;
+      if (!seen.has(key)) { seen.add(key); items.push(rec); }
+      continue;
+    }
+
+    // --- File-Karten (Live-Befund 12.10.2026): chat enthielt vorher den Dateinamen ---
+    // Struktur: Zeile 1 Dateiname, dann Team-/Kanal-Kontext, "Shared by X", "N days ago".
+    if (kind === 'file') {
+      const rec = {
+        kind: 'file',
+        fileName: allLines[0] || null,
+        chat: (allLines[1] && !/^shared by/i.test(allLines[1]) && !/ago$/i.test(allLines[1]) ? clean(allLines[1]).slice(0, 80) : null),
+        author: null,
+        timestampRaw: null,
+        preview: clean(card.innerText).slice(0, 300)
+      };
+      const shared = allLines.find((l) => /^(shared by|geteilt von)\s+/i.test(l));
+      if (shared) {
+        let rest = clean(shared.replace(/^(shared by|geteilt von)\s+/i, ''));
+        // ago-Angabe haengt oft an derselben Zeile: "Shared by Messe, Adrian 13 days ago"
+        const agoM = /\s+((?:a|an|einem?|einer?|\d+)\s+(?:second|minute|hour|day|week|month)s?\s+ago)\s*$/i.exec(rest);
+        if (agoM) { rec.timestampRaw = clean(agoM[1]); rest = rest.slice(0, agoM.index).trim(); }
+        rec.author = rest.slice(0, 80) || null;
+      }
+      const key = `file|${rec.fileName}|${rec.author || ''}`;
+      if (!seen.has(key)) { seen.add(key); items.push(rec); }
+      continue;
+    }
+
     const header = card.querySelector('[data-tid="message-app-card-header"]');
     const headerLines = header ? (header.innerText || '').split('\n').map((x) => x.trim()).filter(Boolean) : [];
-    const allLines = (card.innerText || '').split('\n').map((x) => x.trim()).filter(Boolean);
 
     // Autor: die Avatar-URL traegt den Anzeigenamen (?displayname=Messe%2C%20Adrian)
     const avatar = card.querySelector('[data-tid="message-card-avatar"] img, img[src*="displayname="]');

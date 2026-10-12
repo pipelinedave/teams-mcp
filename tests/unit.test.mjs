@@ -1349,6 +1349,20 @@ describe('Baustein D - parseChannelDateTime (Kanal-Zeitstempel -> ISO mit Jahres
     assert.equal(d.getMinutes(), 27);
   });
 
+  test('relative Vergangenheit ("21 days ago", DE "vor 3 Tagen") -> ISO', () => {
+    const d = new Date(parseChannelDateTime('21 days ago', { now: NOW }));
+    assert.equal(d.getFullYear(), 2026);
+    assert.equal(d.getMonth(), 8);      // 18.09.
+    assert.equal(d.getDate(), 18);
+    const h = new Date(parseChannelDateTime('2 hours ago', { now: NOW }));
+    assert.equal(h.getDate(), 9);
+    assert.equal(h.getHours(), 8);      // 10:00 - 2h
+    const de = new Date(parseChannelDateTime('vor 3 Tagen', { now: NOW }));
+    assert.equal(de.getDate(), 6);
+    const a = new Date(parseChannelDateTime('a day ago', { now: NOW }));
+    assert.equal(a.getDate(), 8);
+  });
+
   test('Robustheit: unsinnige Eingaben -> null', () => {
     assert.equal(parseChannelDateTime(null), null);
     assert.equal(parseChannelDateTime(undefined), null);
@@ -1542,6 +1556,63 @@ describe('Baustein E - searchExtractResults (Teams-Suchergebnisse, Spec-Befund 2
       try { return searchExtractResults({ max: 10 }); } finally { delete global.document; }
     })();
     assert.deepEqual(items, []);
+  });
+
+  test('Meeting-Karte: chat = Titel (nicht "23 OCT"), meetingDate/organizer gesetzt', () => {
+    const card = {
+      innerText: '23 OCT\nJF Aktenplanmigration: PCs und TCs\nFriday 9:00 AM - 9:30 AM\nMicrosoft Teams-Besprechung\nMesse, Adrian invited Heyink, Alla',
+      getAttribute: (n) => (n === 'data-tid' ? 'search-layout' : null),
+      querySelector: (sel) => {
+        if (sel.includes('cal-event-details-card-title')) return { innerText: 'JF Aktenplanmigration: PCs und TCs', getAttribute: (n) => (n === 'data-tid' ? 'cal-event-details-card-title' : null) };
+        if (sel.includes('meeting-day')) return { innerText: '23', getAttribute: (n) => (n === 'data-tid' ? 'meeting-day' : null) };
+        if (sel.includes('meeting-month')) return { innerText: 'OCT', getAttribute: (n) => (n === 'data-tid' ? 'meeting-month' : null) };
+        return null;
+      },
+      querySelectorAll: (sel) => {
+        if (sel === '[data-tid]') return [
+          { getAttribute: (n) => (n === 'data-tid' ? 'meeting-day' : null) },
+          { getAttribute: (n) => (n === 'data-tid' ? 'meeting-month' : null) },
+          { getAttribute: (n) => (n === 'data-tid' ? 'cal-event-details-card-title' : null) }
+        ];
+        return [];
+      }
+    };
+    const items = (() => {
+      global.document = { querySelectorAll: () => [card] };
+      try { return searchExtractResults({ max: 10 }); } finally { delete global.document; }
+    })();
+    assert.equal(items.length, 1);
+    const r = items[0];
+    assert.equal(r.kind, 'meeting');
+    assert.equal(r.chat, 'JF Aktenplanmigration: PCs und TCs'); // NICHT "23 OCT"
+    assert.equal(r.meetingDate, '23 OCT');
+    assert.equal(r.timeRange, 'Friday 9:00 AM - 9:30 AM');
+    assert.equal(r.author, 'Messe, Adrian');                    // aus "invited"
+    assert.equal(r.timestampRaw, undefined);                    // bewusst kein ISO-Raten
+  });
+
+  test('File-Karte: fileName statt chat-Muell, author aus "Shared by", ago als timestampRaw', () => {
+    // Live-Variante: ago haengt oft an der "Shared by"-Zeile
+    const card = {
+      innerText: '260929_Template_Kickoff_Aktenplanmigration.pptx\nPUBS: Fokusteam Aktenplan-Migration\nAllgemein\nShared by Messe, Adrian 13 days ago',
+      getAttribute: (n) => (n === 'data-tid' ? 'search-layout' : null),
+      querySelector: () => null,
+      querySelectorAll: (sel) => {
+        if (sel === '[data-tid]') return [{ getAttribute: (n) => (n === 'data-tid' ? 'serp-file-preview-summary' : null) }];
+        return [];
+      }
+    };
+    const items = (() => {
+      global.document = { querySelectorAll: () => [card] };
+      try { return searchExtractResults({ max: 10 }); } finally { delete global.document; }
+    })();
+    assert.equal(items.length, 1);
+    const r = items[0];
+    assert.equal(r.kind, 'file');
+    assert.equal(r.fileName, '260929_Template_Kickoff_Aktenplanmigration.pptx');
+    assert.equal(r.chat, 'PUBS: Fokusteam Aktenplan-Migration');
+    assert.equal(r.author, 'Messe, Adrian');           // ago abgetrennt
+    assert.equal(r.timestampRaw, '13 days ago');
   });
 });
 
