@@ -290,6 +290,49 @@ export class TeamsClient {
     return parts[0] || raw;
   }
 
+  // Scrollt den Message-Pane des aktiven Chats ans ENDE (neueste Nachricht).
+  // ROOT-CAUSE (Live-Befund 12.10.2026, Chat "moveAI: Public All-Hands Call"): Teams Web
+  // stellt beim Oeffnen eines Chats die Leseposition/Unread-Grenze wieder her — der
+  // Viewport zeigt aeltere Nachrichten und der DOM-only-Scraper (_scrapeMessages liest
+  // querySelectorAll ohne Scrollen) sieht die NEUESTEN Meldungen nicht mehr. Frische
+  // Anhaenge (z.B. am Folgetag geteilte PDFs) blieben dadurch unerreichbar.
+  // Fix: vor dem Scrape (1) die "neue Nachrichten"-Bar klicken (falls sichtbar) und
+  // (2) wiederholt ans Listenende scrollen — die virtualisierte Liste rendert beim
+  // Runterscrollen jeweils nach, bis "bottom" erreicht ist.
+  async _scrollChatToLatest(page, { maxRounds = 8, settleMs = 350 } = {}) {
+    // (1) Jump-to-latest Bar (EN/DE-Varianten, Naming je nach Rollout unterschiedlich)
+    await page.evaluate(() => {
+      const bar = document.querySelector(
+        '[data-tid*="new-messages" i], [data-tid*="newmessages" i], [data-tid*="jump-to" i], [aria-label*="latest" i], [aria-label*="neueste" i]'
+      );
+      if (bar) { try { bar.click(); } catch (e) { /* nur Zusatzversuch */ } }
+    }).catch(() => {});
+    await page.waitForTimeout(settleMs);
+
+    // (2) Scroll-Loop: Container finden, nach unten fahren, bis "bottom"/"none"
+    for (let round = 0; round < maxRounds; round++) {
+      const status = await page.evaluate(() => {
+        let el = document.querySelector('[data-tid="message-pane"]');
+        if (!el) {
+          const msgs = document.querySelectorAll('[data-tid="chat-pane-message"], [data-tid="message-body"], .fui-ChatMessage__body, .fui-ChatMyMessage__body');
+          const last = msgs[msgs.length - 1];
+          let anc = last ? last.parentElement : null;
+          while (anc && anc !== document.body) {
+            if (anc.scrollHeight > anc.clientHeight + 10) { el = anc; break; }
+            anc = anc.parentElement;
+          }
+        }
+        if (!el) return 'none';
+        const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 5;
+        if (atBottom) return 'bottom';
+        el.scrollTop = el.scrollHeight;
+        return 'moved';
+      }).catch(() => 'none');
+      if (status !== 'moved') break;
+      await page.waitForTimeout(settleMs);
+    }
+  }
+
   // Gemeinsamer Message-Scraper für Chats UND Kanäle (Baustein A/B): extrahiert die
   // im Message-Pane sichtbaren Nachrichten (Autor, Zeitstempel, Text, Medien, Anhänge).
   // Die Blob-Medien werden im Browser zu dataURLs aufgelöst und anschließend in Node
@@ -632,6 +675,11 @@ export class TeamsClient {
         throw new Error(`Sicherheitsnetz: Der geöffnete Chat '${activeChat}' stimmt nicht mit dem Ziel '${picked.title}' überein. Es wurden KEINE Nachrichten des Ziel-Chats gelesen. (Der Eintrag ist vermutlich kein klickbarer Chat — pruefe die vollständige Liste via teams_list_chats mit hoeherem limit.)`);
       }
     }
+
+    // Befund 12.10.2026 (moveAI-Anhaenge): Teams stellt beim Chat-Oeffnen die
+    // Leseposition wieder her — ohne Sprung ans Listenende sieht der Scraper nur
+    // aeltere Nachrichten und frische Anhaenge bleiben unsichtbar (s. _scrollChatToLatest).
+    await this._scrollChatToLatest(page);
 
     const messages = await this._scrapeMessages(page, {
       max: limit,
