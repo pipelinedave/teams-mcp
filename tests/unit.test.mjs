@@ -32,7 +32,7 @@ import {
   DEFAULT_DOWNLOAD_EXTENSIONS
 } from '../src/teamsClient.js';
 import { browserManager } from '../src/browserManager.js';
-import { cleanSpeakerName, aggregateEvents, isBotOrUiName } from '../src/speakerTracker.js';
+import { cleanSpeakerName, aggregateEvents, isBotOrUiName, isPlausibleSpeakerName, speakerNameFromAriaLabel, pickRealChatPartner, collectMeetingStateInPage, IN_PAGE_HELPERS_SOURCE } from '../src/speakerTracker.js';
 import { extractActivityFromDom } from '../src/activityClient.js';
 import { classify, analyzeItems, buildReportText, writeReport, CATEGORIES } from '../src/activityAnalyzer.js';
 import { toMinutes, writeTimestampedReport, ActivityReportScheduler, DEFAULT_SCHEDULE, runSchedulerControl } from '../src/activityReportScheduler.js';
@@ -1889,5 +1889,339 @@ describe('Baustein D - collectReactionsFromRow (Message Reactions / Checkmarks)'
   test('Reaktion ohne Emoji/Slug wird verworfen (z.B. Plus-Button)', () => {
     const row = makeRow({ pills: [{ innerText: '', getAttribute: () => null, querySelector: () => null }] });
     assert.deepEqual(collectReactionsFromRow(row), []);
+  });
+});
+
+// ============================================================================
+// speakerTracker-Fix (15.10.2026): Neue Pure-Funktionen + In-Page-DOM-Logik
+// (Root Causes der leeren Timelines: falsches treeitem im Chat-Fallback,
+// doppelte Backslash-Regexes in page.evaluate, keine Join-Retrys)
+// ============================================================================
+describe('speakerNameFromAriaLabel - Active-Speaker-aria-labels (DE/EN)', () => {
+  const H = { speakerNameFromAriaLabel, isPlausibleSpeakerName, isBotOrUiName };
+
+  test('"X spricht" (DE) -> Name', () => {
+    assert.equal(speakerNameFromAriaLabel('Stefan Maciolek spricht'), 'Stefan Maciolek');
+  });
+
+  test('"X is speaking" (EN) -> Name', () => {
+    assert.equal(speakerNameFromAriaLabel('Robert Lábas is speaking'), 'Robert Lábas');
+  });
+
+  test('"X, speaking" mit Komma -> Name', () => {
+    assert.equal(speakerNameFromAriaLabel('Theys Schiller, speaking'), 'Theys Schiller');
+  });
+
+  test('Komplexes Label "X spricht, Auflegen" -> Name', () => {
+    assert.equal(speakerNameFromAriaLabel('Stefan Maciolek spricht, Auflegen'), 'Stefan Maciolek');
+  });
+
+  test('"Spricht: X" Variante -> Name', () => {
+    assert.equal(speakerNameFromAriaLabel('Spricht: David Hallmann'), 'David Hallmann');
+  });
+
+  test('Label ohne Sprecheranzeige -> leerer String', () => {
+    assert.equal(speakerNameFromAriaLabel('Auflegen'), '');
+    assert.equal(speakerNameFromAriaLabel('Stefan Maciolek'), '');
+    assert.equal(speakerNameFromAriaLabel(''), '');
+    assert.equal(speakerNameFromAriaLabel(null), '');
+  });
+
+  test('REGRESSION (15.10.2026): Funktion enthaelt keine doppelten Backslashes mehr', () => {
+    // Der Original-Bug: "\\s" in der Source matcht literalen Backslash, nicht
+    // Whitespace -> "Stefan Maciolek spricht" wurde NIE erkannt.
+    const src = speakerNameFromAriaLabel.toString();
+    assert.ok(!src.includes('\\\\s'), 'keine \\\\s-Escapes in der Funktions-Source');
+    assert.ok(!src.includes('\\\\('), 'keine \\\\(-Escapes in der Funktions-Source');
+    // Und das Verhalten ist bewiesen (gleiche Faelle wie oben, die vorher null waren):
+    assert.ok(speakerNameFromAriaLabel('Stefan Maciolek spricht'));
+  });
+});
+
+describe('isPlausibleSpeakerName - UI-Woerter/Status sind keine Sprechernamen', () => {
+  test('echte Namen durchlassen', () => {
+    assert.equal(isPlausibleSpeakerName('Stefan Maciolek'), true);
+    assert.equal(isPlausibleSpeakerName('Theys Schiller'), true);
+  });
+
+  test('UI-/Status-Wörter filtern', () => {
+    assert.equal(isPlausibleSpeakerName('Anwesend'), false);
+    assert.equal(isPlausibleSpeakerName('Present'), false);
+    assert.equal(isPlausibleSpeakerName('Du'), false);
+    assert.equal(isPlausibleSpeakerName('You'), false);
+    assert.equal(isPlausibleSpeakerName('Ich'), false);
+    assert.equal(isPlausibleSpeakerName('Gast'), false);
+    assert.equal(isPlausibleSpeakerName('12345'), false);
+  });
+
+  test('Bots/UI-Eintraege filtern (Delegate auf isBotOrUiName)', () => {
+    assert.equal(isPlausibleSpeakerName('Copilot'), false);
+    assert.equal(isPlausibleSpeakerName('Live Captions'), false);
+  });
+
+  test('leer/zu lang/unerlaubt', () => {
+    assert.equal(isPlausibleSpeakerName(''), false);
+    assert.equal(isPlausibleSpeakerName(null), false);
+    assert.equal(isPlausibleSpeakerName('X'.repeat(80)), false);
+  });
+});
+
+describe('pickRealChatPartner - Chat-Fallback filtert Section-Header/Bots', () => {
+  test('REGRESSION (15.10.2026): "Copilot" als erstes treeitem wird uebersprungen', () => {
+    // Neues Teams-Web: Chatliste = treeitem-Baum, "Copilot" + Section-Header
+    // stehen VOR den echten Chats. chatRows[0] lieferte deshalb immer Copilot.
+    const candidates = [
+      { title: 'Copilot' },
+      { title: 'Chats' },
+      { title: 'Favoriten' },
+      { title: 'Stefan Maciolek' },
+      { title: 'Robert Lábas' },
+    ];
+    assert.equal(pickRealChatPartner(candidates), 'Stefan Maciolek');
+  });
+
+  test('nur Bots/Sektionen -> null (statt erfundenem Partner)', () => {
+    assert.equal(pickRealChatPartner([{ title: 'Copilot' }, { title: 'Chats' }]), null);
+    assert.equal(pickRealChatPartner([]), null);
+    assert.equal(pickRealChatPartner(null), null);
+  });
+
+  test('See-more-Paginator und "Alle ..."-Eintraege werden gefiltert', () => {
+    const candidates = [
+      { title: 'Teams' },
+      { title: 'See all your teams' },
+      { title: 'Mehr anzeigen' },
+      { title: 'Theys Schiller' },
+    ];
+    assert.equal(pickRealChatPartner(candidates), 'Theys Schiller');
+  });
+
+  test('Mehrzeiliger Eintrag: erste Zeile gewinnt, Suffixe werden bereinigt', () => {
+    const candidates = [{ title: 'Yannick Bülter (Gast)\nvor 5 Min.' }];
+    assert.equal(pickRealChatPartner(candidates), 'Yannick Bülter');
+  });
+
+  test('Kandidaten als reine Strings werden akzeptiert', () => {
+    assert.equal(pickRealChatPartner(['Copilot', 'Theys Schiller']), 'Theys Schiller');
+  });
+});
+
+describe('collectMeetingStateInPage - In-Page-DOM-Logik (Fake-DOM, gleiche Source wie im Browser)', () => {  // Minimaler Fake-DOM-Harness: genug Oberflaeche fuer collectMeetingStateInPage.
+  // Selektor-Parsing via Regex (vertraeglich mit case-insensitive "[... i]"-Flags).
+  function tidValue(sel) {
+    const m = sel.match(/\[data-tid\*?\s*=\s*"([^"]+)"/);
+    return m ? { attr: 'data-tid', op: sel.includes('*=') ? 'contains' : 'exact', val: m[1] } : null;
+  }
+  function ariaValue(sel) {
+    const m = sel.match(/\[aria-label\*?\s*=\s*"([^"]+)"/);
+    return m ? { attr: 'aria-label', op: sel.includes('*=') ? 'contains' : 'exact', val: m[1] } : null;
+  }
+  function elMatchesAttrs(el, selPart) {
+    selPart = selPart.trim();
+    const t = tidValue(selPart);
+    if (t) {
+      const v = String(el._attrs['data-tid'] || '');
+      return t.op === 'exact' ? v === t.val : v.toLowerCase().includes(t.val.toLowerCase());
+    }
+    const a = ariaValue(selPart);
+    if (a) {
+      const v = String(el._attrs['aria-label'] || '');
+      return a.op === 'exact' ? v === a.val : v.toLowerCase().includes(a.val.toLowerCase());
+    }
+    return false;
+  }
+
+  function fakeEl({ tag = 'div', attrs = {}, text = '', children = [], parent = null } = {}) {
+    const el = {
+      tagName: tag.toUpperCase(),
+      _attrs: attrs,
+      innerText: text,
+      textContent: text,
+      _children: children,
+      _parent: parent,
+      className: '',
+      getAttribute: (n) => (n in attrs ? attrs[n] : null),
+      querySelectorAll: () => [],
+      closest: () => null,
+      matches: () => false,
+      querySelector: () => null,
+      getBoundingClientRect: () => ({ width: 10, height: 10 }),
+    };
+    for (const c of children) c._parent = el;
+    el.querySelector = (sel) => {
+      for (const part of sel.split(',')) {
+        for (const c of children) {
+          if (elMatchesAttrs(c, part)) return c;
+        }
+      }
+      return null;
+    };
+    el.closest = (sel) => {
+      let p = el._parent;
+      while (p) {
+        for (const part of sel.split(',')) {
+          if (elMatchesAttrs(p, part)) return p;
+        }
+        p = p._parent;
+      }
+      return null;
+    };
+    el.matches = (sel) => {
+      for (const part of sel.split(',')) {
+        if (elMatchesAttrs(el, part)) return true;
+      }
+      return false;
+    };
+    return el;
+  }
+
+  const H = {
+    speakerNameFromAriaLabel,
+    isPlausibleSpeakerName,
+    isBotOrUiName
+  };
+
+  function withFakeDocument(fakeDoc, fn) {
+    const prev = globalThis.document;
+    globalThis.document = fakeDoc;
+    try {
+      return fn();
+    } finally {
+      globalThis.document = prev;
+    }
+  }
+
+  test('REGRESSION (15.10.2026): "X spricht"-aria-label wird als aktiver Sprecher erkannt', () => {
+    // Vor dem Fix matchte die doppelte-Backslash-Regex im Browser nie -> activeSpeakers immer leer.
+    const tile = fakeEl({
+      attrs: { 'aria-label': 'Stefan Maciolek spricht', 'data-tid': 'video-tile' },
+    });
+    const doc = {
+      title: 'Chat | Microsoft Teams',
+      querySelector: () => null,
+      querySelectorAll: (sel) => (sel.includes('spricht') ? [tile] : []),
+    };
+    const state = withFakeDocument(doc, () => collectMeetingStateInPage(true, H));
+    assert.deepEqual(state.activeSpeakers, ['Stefan Maciolek']);
+  });
+
+  test('Sprecher via Namens-Overlay im Tile (data-tid="video-tile-name")', () => {
+    const nameNode = fakeEl({ attrs: { 'data-tid': 'video-tile-name' }, text: 'Robert Lábas' });
+    const tile = fakeEl({
+      attrs: { 'data-tid': 'video-tile' },
+      children: [nameNode],
+    });
+    // Aktives Element = Kind des Tiles (data-tid*="speaking"-Treffer), Name sitzt im Tile-Overlay:
+    const active = fakeEl({
+      attrs: { 'data-tid': 'speaking-indicator' },
+      parent: tile,
+    });
+    const doc = {
+      title: 'Teams',
+      querySelector: () => null,
+      querySelectorAll: (sel) => (sel.includes('speaking') ? [active] : []),
+    };
+    const state = withFakeDocument(doc, () => collectMeetingStateInPage(true, H));
+    assert.deepEqual(state.activeSpeakers, ['Robert Lábas']);
+  });
+
+  test('Bot-Namen ("Copilot") werden als aktive Sprecher verworfen', () => {
+    const tile = fakeEl({ attrs: { 'aria-label': 'Copilot spricht' } });
+    const doc = {
+      title: 'Teams',
+      querySelector: () => null,
+      querySelectorAll: (sel) => (sel.includes('spricht') ? [tile] : []),
+    };
+    const state = withFakeDocument(doc, () => collectMeetingStateInPage(true, H));
+    assert.deepEqual(state.activeSpeakers, []);
+  });
+
+  test('Call-Controls (aria-label "Auflegen") setzen inMeeting=true + Titel aus doc.title', () => {
+    const hangup = fakeEl({ tag: 'button', attrs: { 'aria-label': 'Auflegen' } });
+    const doc = {
+      title: 'Babelsberg Review | Microsoft Teams',
+      querySelector: (sel) => (sel.includes('Auflegen') ? hangup : null),
+      querySelectorAll: () => [],
+    };
+    const state = withFakeDocument(doc, () => collectMeetingStateInPage(true, H));
+    assert.equal(state.inMeeting, true);
+    // Titel-Fallback aus document.title (korrigierte Regex):
+    assert.equal(state.meetingTitle, 'Babelsberg Review');
+  });
+
+  test('Kein Meeting -> inMeeting=false, Default-Titel "Teams Meeting"', () => {
+    const doc = {
+      title: 'Neues Element',
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    };
+    const state = withFakeDocument(doc, () => collectMeetingStateInPage(true, H));
+    assert.equal(state.inMeeting, false);
+    assert.equal(state.meetingTitle, 'Teams Meeting');
+    assert.deepEqual(state.participants, []);
+    assert.deepEqual(state.activeSpeakers, []);
+  });
+
+  test('deep=false liefert nur activeSpeakers (leichtgewichtiger Sampler-Pfad)', () => {
+    const tile = fakeEl({ attrs: { 'aria-label': 'Theys Schiller is speaking' } });
+    const doc = {
+      title: 'Teams',
+      querySelector: () => null,
+      querySelectorAll: (sel) => (sel.includes('speaking') ? [tile] : []),
+    };
+    const state = withFakeDocument(doc, () => collectMeetingStateInPage(false, H));
+    assert.deepEqual(state.activeSpeakers, ['Theys Schiller']);
+    assert.equal(state.inMeeting, undefined);
+    assert.equal(state.meetingTitle, undefined);
+  });
+});
+
+describe('aggregateEvents - Bots werden nicht als Sprecher aggregiert (Fix 15.10.2026)', () => {
+  test('Copilot-Samples erzeugen keine Intervalle', () => {
+    const base = 1726040000000;
+    const samples = [
+      { speaker: 'Copilot', timestamp: base },
+      { speaker: 'Copilot', timestamp: base + 300 },
+      { speaker: 'Copilot', timestamp: base + 600 }
+    ];
+    const intervals = aggregateEvents(samples, { meetingStartEpochMs: base });
+    assert.equal(intervals.length, 0);
+  });
+
+  test('Gemischte Samples: nur echte Sprecher landen in den Intervallen', () => {
+    const base = 1726040000000;
+    const samples = [
+      { speaker: 'Copilot', timestamp: base },
+      { speaker: 'Stefan Maciolek', timestamp: base + 100 },
+      { speaker: 'Stefan Maciolek', timestamp: base + 400 },
+      { speaker: 'Stefan Maciolek', timestamp: base + 700 }
+    ];
+    const intervals = aggregateEvents(samples, { meetingStartEpochMs: base });
+    assert.equal(intervals.length, 1);
+    assert.equal(intervals[0].speaker, 'Stefan Maciolek');
+  });
+});
+
+describe('IN_PAGE_HELPERS_SOURCE - Injektions-Factory (Fix 15.10.2026)', () => {
+  test('Factory ist ohne Modul-Scope auswertbar (new Function, globaler Scope)', () => {
+    // Beweist den zweiten Injektions-Bug: isPlausibleSpeakerName ruft intern
+    // cleanSpeakerName/isBotOrUiName — materialisiert man die Funktionen
+    // EINZELN im Seitenkontext, wirft das ReferenceError (im Modul-Scope von
+    // Node funktioniert es, im Browser nicht). Die Factory verdrahtet alle
+    // Helfer in einem gemeinsamen Scope.
+    const helpers = new Function('return (' + IN_PAGE_HELPERS_SOURCE + ')')();
+    assert.equal(typeof helpers.cleanSpeakerName, 'function');
+    assert.equal(typeof helpers.isBotOrUiName, 'function');
+    assert.equal(typeof helpers.isPlausibleSpeakerName, 'function');
+    assert.equal(typeof helpers.speakerNameFromAriaLabel, 'function');
+  });
+
+  test('Materialisierte Helfer verhalten sich identisch zu den Node-Originalen', () => {
+    const helpers = new Function('return (' + IN_PAGE_HELPERS_SOURCE + ')')();
+    assert.equal(helpers.isPlausibleSpeakerName('Stefan Maciolek'), true);
+    assert.equal(helpers.isPlausibleSpeakerName('Copilot'), false);
+    assert.equal(helpers.isPlausibleSpeakerName('Anwesend'), false);
+    assert.equal(helpers.speakerNameFromAriaLabel('Robert Lábas spricht'), 'Robert Lábas');
+    assert.equal(helpers.isBotOrUiName('Copilot'), true);
   });
 });

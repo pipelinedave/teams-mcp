@@ -42,6 +42,104 @@ export function isBotOrUiName(name) {
 }
 
 /**
+ * Generische UI-Wörter, die nie ein echter Sprecher-/Teilnehmername sind
+ * (Video-Tile-Overlays und aria-labels enthalten oft Status-Wörter wie
+ * "Anwesend" oder die eigene Person als "Du"/"You").
+ */
+const UI_NAME_PATTERNS = [
+  /^(du|you|ich|me|sie|er|es)$/i,
+  /^(anwesend|present|in the meeting|im meeting|in this meeting|away|abwesend|offline|busy|beschäftigt|do not disturb|nicht stören)$/i,
+  /^(guest|gast|organizer|organisator|presenter|präsentator|external|extern)$/i,
+  /^(meeting|call|anruf|besprechung|teams)$/i,
+  /^\d+$/,
+];
+
+/**
+ * True if the string looks like a real human speaker/participant name and not
+ * a UI label, status word or bot entry.
+ */
+export function isPlausibleSpeakerName(name) {
+  const n = cleanSpeakerName(name || '');
+  if (!n || n.length > 60) return false;
+  if (n.includes('\\n') || n.includes('\n')) return false;
+  if (isBotOrUiName(n)) return false;
+  return !UI_NAME_PATTERNS.some((re) => re.test(n.trim()));
+}
+
+/**
+ * Extrahiert den Sprechernamen aus einer aria-label, die eine
+ * Active-Speaker-Anzeige enthaelt (DE + EN):
+ *   "Stefan Maciolek spricht"            -> "Stefan Maciolek"
+ *   "Stefan Maciolek is speaking"        -> "Stefan Maciolek"
+ *   "Stefan Maciolek, speaking"          -> "Stefan Maciolek"
+ *   "Stefan Maciolek spricht, Auflegen"  -> "Stefan Maciolek"
+ * Liefert '', wenn kein sprechender Name erkannt wird.
+ *
+ * WICHTIG: Diese Funktion wird als Funktions-Source in page.evaluate injiziert
+ * (siehe collectMeetingStateInPage). Regexes hier muessen SINGLE-backslash
+ * sein — Playwright serialisiert die Funktion 1:1 in den Browser (doppelte
+ * Backslashes wuerden dort literal auf "\s" matchen und nie greifen — genau
+ * der Bug, der bis 15.10.2026 die Erkennung lahmlegte).
+ */
+export function speakerNameFromAriaLabel(aria) {
+  if (!aria) return '';
+  const a = String(aria).trim();
+  if (!a) return '';
+  // Name am Anfang, danach optional Separator + "spricht"/"is speaking"/"speaking"
+  const m = a.match(/^(.{1,60}?)\s*(?:,\s*|-\s*|:\s*)?(?:spricht|is speaking|speaking)\b(?:[,:].*)?$/i);
+  if (m) return m[1].trim();
+  // Variante "Spricht: Name" / "Speaking: Name"
+  const m2 = a.match(/^(?:spricht|is speaking|speaking)\s*:\s*(.{1,60})$/i);
+  if (m2) return m2[1].trim();
+  return '';
+}
+
+/**
+ * Sektions-/Nav-Titel im Teams-Chat-Baum, die nie ein echter 1:1-Chat-Partner
+ * sind. Das neue Teams-Web rendert die Chatliste als role="treeitem"-Baum mit
+ * Section-Headern ("Copilot", "Favoriten", "Chats", ...) VOR den echten
+ * Chat-Eintraegen — blindes chatRows[0] lieferte daher immer "Copilot"
+ * (Root Cause der leeren Timelines bis 15.10.2026). Eigene Liste statt Import
+ * aus teamsClient.js, um den Import-Zyklus teamsClient <-> speakerTracker
+ * zu vermeiden (Bewusstes, kommentiertes Duplikat).
+ */
+const CHAT_SECTION_TITLES = new Set([
+  'copilot', 'quick views', 'schnellansicht', 'drafts', 'entwürfe', 'entwuerfe',
+  'favorites', 'favoriten', 'chats', 'teams', 'kanäle', 'kanaele', 'channels',
+  'activity', 'aktivität', 'aktivitaet', 'calendar', 'kalender', 'anrufe', 'calls',
+  'communities', 'outlook', 'mehr', 'more', 'unread', 'ungelesen', 'mentions',
+  'erwähnungen', 'erwaehnungen', 'followed threads', 'gefolgte threads',
+  'discover', 'entdecken', 'meine teams', 'your teams', 'hidden teams',
+  'ausgeblendete teams', 'versteckte teams', 'manage teams', 'teams verwalten',
+  'create a team', 'team erstellen', 'gemeinschaften',
+]);
+
+/**
+ * Wählt aus DOM-geordneten Chat-Kandidaten ({ title }) den ersten echten
+ * (nicht-Bot, keine Sektions-/Nav-Überschrift) Chat-Partner. Liefert den
+ * bereinigten Titel oder null, wenn kein echter Partner gefunden wurde.
+ *
+ * Bewusst PURE gehalten (kein DOM-Zugriff), damit sie ohne Browser testbar ist.
+ */
+export function pickRealChatPartner(candidates) {
+  for (const c of candidates || []) {
+    const rawTitle = String((c && (c.title ?? c)) || '');
+    const title = cleanSpeakerName(rawTitle.split('\n')[0] || '');
+    if (!title) continue;
+    if (isBotOrUiName(title)) continue;
+    const lower = title.toLowerCase();
+    if (CHAT_SECTION_TITLES.has(lower)) continue;
+    if (/^(see |alle |mehr anzeigen|show |join |beim |ansehen )/i.test(lower)) continue;
+    if (isPlausibleSpeakerName(title) || title.length >= 3) {
+      // Gruppenchats/Mehrwort-Titel sind auch gueltige "Partner" — nur einzelne
+      // UI-Woerter wurden oben schon gefiltert.
+      return title;
+    }
+  }
+  return null;
+}
+
+/**
  * Aggregates raw discrete timestamp samples or state transitions into clean, continuous intervals.
  * Merges short speech pauses (< minGapMs) and ignores momentary noise spikes (< minDurationMs).
  */
@@ -54,6 +152,7 @@ export function aggregateEvents(samples, options = {}) {
   for (const sample of samples) {
     const speaker = cleanSpeakerName(sample.speaker);
     if (!speaker) continue;
+    if (isBotOrUiName(speaker)) continue; // Bots/UI-Eintraege niemals als Sprecher
     if (!bySpeaker.has(speaker)) bySpeaker.set(speaker, []);
     bySpeaker.get(speaker).push(sample.timestamp);
   }
@@ -106,97 +205,250 @@ export function aggregateEvents(samples, options = {}) {
   return allIntervals;
 }
 
+// ---------------------------------------------------------------------------
+// IN-PAGE-DOM-LOGIK
+// ---------------------------------------------------------------------------
+// Die folgende Funktion wird ALS SOURCE in page.evaluate injiziert (gleiche
+// Technik wie teamsClient.expandChatList: Funktions-Source + new Function).
+// Sie ist bewusst self-contained und bekommt die Node-seitigen Pure-Funktionen
+// (speakerNameFromAriaLabel, isPlausibleSpeakerName, isBotOrUiName) als
+// helpers-Objekt injiziert — EINE Source of Truth fuer Node-Tests und Browser.
+//
+// deep=true  -> voller Meeting-State { inMeeting, meetingTitle, participants, activeSpeakers }
+// deep=false -> nur { activeSpeakers } (leichtgewichtig, 100ms-Sampler)
+// (exportiert fuer Unit-Tests mit Fake-DOM)
+export function collectMeetingStateInPage(deep, helpers) {
+  const speakerNameFromAriaLabel = helpers.speakerNameFromAriaLabel;
+  const isPlausibleSpeakerName = helpers.isPlausibleSpeakerName;
+  const isBotOrUiName = helpers.isBotOrUiName;
+
+  // --- Aktive Sprecher erkennen (mehrere Fallback-Layer gegen kosmetische DOM-Aenderungen) ---
+  const activeSelector = [
+    '[data-tid="active-speaker-border"]',
+    '[data-tid="activeSpeaker"]',
+    '[data-is-speaking="true"]',
+    '[data-speaker-state="speaking"]',
+    '[data-tid*="speaking" i]',
+    '[class*="activeSpeaker" i]',
+    '[class*="active-speaker" i]',
+    '[class*="speaking" i]',
+    '.speaking',
+    '[aria-label*="spricht" i]',
+    '[aria-label*="is speaking" i]',
+    '[aria-label*=", speaking" i]',
+  ].join(', ');
+
+  // Namens-Overlay-Knoten in Tiles (alte + neue UI)
+  const NAME_NODE_SEL = [
+    '[data-tid="roster-avatar-name"]',
+    '[data-tid="video-tile-name"]',
+    '[data-tid="participant-name"]',
+    '[data-tid*="avatar-name" i]',
+    '[data-tid*="tile-name" i]',
+    '[class*="participant-name" i]',
+    '[class*="displayName" i]',
+  ].join(', ');
+
+  // Container, in denen ein aktives Element sitzt (spezifisch -> generisch)
+  const TILE_CONTAINER_SEL = [
+    '[data-tid*="video-tile" i]',
+    '[data-tid*="participant" i]',
+    '[data-tid*="roster" i]',
+    '[data-tid*="tile" i]',
+    '[role="listitem"]',
+  ].join(', ');
+
+  function nameFromNode(node) {
+    if (!node) return '';
+    // 1) Namens-Overlay im Knoten selbst / im Knoten-Baum
+    const nameNode = node.matches?.(NAME_NODE_SEL) ? node : node.querySelector?.(NAME_NODE_SEL);
+    if (nameNode) {
+      const t = (nameNode.innerText || nameNode.textContent || '').split('\n')[0].trim();
+      if (t && isPlausibleSpeakerName(t)) return t;
+    }
+    // 2) aria-label des Knotens (evtl. "X spricht"-Formular)
+    const aria = node.getAttribute?.('aria-label') || '';
+    if (aria) {
+      const fromAria = speakerNameFromAriaLabel(aria);
+      if (fromAria && isPlausibleSpeakerName(fromAria)) return fromAria;
+      const plain = aria.split('\n')[0].trim();
+      if (plain && isPlausibleSpeakerName(plain)) return plain;
+    }
+    // 3) Textinhalt, erste Zeile
+    const text = (node.innerText || node.textContent || '').split('\n')[0].trim();
+    if (text && isPlausibleSpeakerName(text)) return text;
+    return '';
+  }
+
+  function resolveActiveSpeakerName(el) {
+    // Layer A: aria-label des aktiven Elements selbst ("X spricht")
+    const viaAria = speakerNameFromAriaLabel(el.getAttribute('aria-label') || '');
+    if (viaAria && isPlausibleSpeakerName(viaAria)) return viaAria;
+
+    // Layer B: Namens-Overlay im aktiven Element
+    const viaNode = nameFromNode(el);
+    if (viaNode) return viaNode;
+
+    // Layer C: naechster Tile-/Roster-Container (aufwaerts), dort Overlay oder aria-label
+    const container = el.closest?.(TILE_CONTAINER_SEL);
+    if (container) {
+      const viaContainerNode = nameFromNode(container.querySelector(NAME_NODE_SEL));
+      if (viaContainerNode) return viaContainerNode;
+      const containerAria = container.getAttribute('aria-label') || '';
+      const viaContainerAria = speakerNameFromAriaLabel(containerAria) || containerAria.split('\n')[0].trim();
+      if (viaContainerAria && isPlausibleSpeakerName(viaContainerAria)) return viaContainerAria;
+    }
+    return '';
+  }
+
+  const activeSpeakers = [];
+  const seen = new Set();
+  try {
+    const els = document.querySelectorAll(activeSelector);
+    for (const el of els) {
+      const name = resolveActiveSpeakerName(el);
+      if (name && !seen.has(name)) {
+        seen.add(name);
+        activeSpeakers.push(name);
+      }
+    }
+  } catch (e) {}
+
+  if (!deep) return { activeSpeakers };
+
+  // --- Meeting-/Call-Erkennung (mehrere Indikatoren) ---
+  const inMeetingSelector = [
+    '[data-tid="call-controls"]',
+    '[data-tid="hangup-button"]',
+    '[data-tid="hangup-btn"]',
+    '[data-tid="calling-screen"]',
+    '[data-tid="calling-stage"]',
+    '[data-tid="call-status-bar"]',
+    '[data-tid*="active-call" i]',
+    'div[id*="calling-stage"]',
+    'div[id*="calling-container"]',
+    'button[aria-label*="Auflegen" i]',
+    'button[aria-label*="Hang up" i]',
+    'button[aria-label*="Leave" i]',
+    'button[aria-label*="Verlassen" i]',
+  ].join(', ');
+
+  let inMeeting = false;
+  try {
+    inMeeting = !!document.querySelector(inMeetingSelector);
+  } catch (e) {}
+
+  // --- Meeting-Titel ---
+  let meetingTitle = '';
+  const titleSel = [
+    '[data-tid="calling-header-title"]',
+    '[data-tid="call-title"]',
+    '[data-tid="header-meeting-title"]',
+    '[data-tid="top-bar-title"]',
+    '[data-tid*="meeting-title" i]',
+    'h1[data-tid*="meeting"]',
+  ].join(', ');
+  try {
+    const titleEl = document.querySelector(titleSel);
+    if (titleEl) meetingTitle = (titleEl.innerText || titleEl.textContent || '').split('\n')[0].trim();
+  } catch (e) {}
+  if (!meetingTitle) {
+    // Korrigierte Regex (bis 15.10.2026 stand hier eine doppelte-Backslash-Variante,
+    // die nie matchen konnte: "\\s" matcht literalen Backslash, nicht Whitespace).
+    const docTitle = document.title || '';
+    const match = docTitle.match(/^(.+?)\s*\|\s*Microsoft Teams/i);
+    if (match && !match[1].toLowerCase().includes('chat')) {
+      meetingTitle = match[1].trim();
+    }
+  }
+
+  // --- Teilnehmer (sichtbare Tiles/Roster) ---
+  const participants = [];
+  const pSeen = new Set();
+  try {
+    const participantEls = document.querySelectorAll(
+      '[data-tid="roster-avatar-name"], [data-tid*="video-tile" i] [aria-label], [data-tid*="participant" i] [aria-label], [role="listitem"] [aria-label]'
+    );
+    for (const el of participantEls) {
+      let name = (el.getAttribute('aria-label') || '').split('\n')[0].trim();
+      if (!name) name = (el.innerText || '').split('\n')[0].trim();
+      const cleaned = speakerNameFromAriaLabel(name) || name;
+      if (cleaned && isPlausibleSpeakerName(cleaned) && !pSeen.has(cleaned) && cleaned.length < 50) {
+        pSeen.add(cleaned);
+        participants.push(cleaned);
+      }
+      if (participants.length >= 30) break;
+    }
+  } catch (e) {}
+
+  return {
+    inMeeting,
+    meetingTitle: meetingTitle || 'Teams Meeting',
+    participants,
+    activeSpeakers
+  };
+}
+
+// Helper-Quellen, die bei JEDER page.evaluate-Injektion mitgegeben werden.
+// Playwright kann Funktionsargumente NICHT serialisieren (im Gegensatz zu
+// Puppeteer) — deshalb werden die Pure-Funktionen als SOURCE uebergeben.
+// WICHTIG: new Function materialisiert im GLOBALEN Scope — die internen
+// Referenzen (isPlausibleSpeakerName -> cleanSpeakerName/isBotOrUiName/
+// UI_NAME_PATTERNS, isBotOrUiName -> BOT_NAME_PATTERNS) wuerden dort
+// ReferenceError werfen. Die Factory-Source verdrahtet alle Helfer UND ihre
+// Konstanten in EINEM gemeinsamen Scope (EINE Source of Truth fuer
+// Node-Tests und Browser).
+const IN_PAGE_HELPERS_SRC = '(() => {\n'
+  + `const BOT_NAME_PATTERNS = [${BOT_NAME_PATTERNS.map((r) => r.toString()).join(', ')}];\n`
+  + `const UI_NAME_PATTERNS = [${UI_NAME_PATTERNS.map((r) => r.toString()).join(', ')}];\n`
+  + `const cleanSpeakerName = ${cleanSpeakerName.toString()};\n`
+  + `const isBotOrUiName = ${isBotOrUiName.toString()};\n`
+  + `const isPlausibleSpeakerName = ${isPlausibleSpeakerName.toString()};\n`
+  + `const speakerNameFromAriaLabel = ${speakerNameFromAriaLabel.toString()};\n`
+  + 'return { cleanSpeakerName, isBotOrUiName, isPlausibleSpeakerName, speakerNameFromAriaLabel };\n'
+  + '})()';
+
+// Fuer Regression-Tests (Factory muss ohne Modul-Scope auswertbar sein)
+export const IN_PAGE_HELPERS_SOURCE = IN_PAGE_HELPERS_SRC;
+
+function materializeInPageHelpersSrc() {
+  return IN_PAGE_HELPERS_SRC;
+}
+
 export class SpeakerTracker {
   constructor() {
     this.activeSessions = new Map(); // tenant -> { startTimeEpochMs, outputPath, timer, samples: [], meetingTitle: '' }
   }
 
   /**
+   * Fuehrt collectMeetingStateInPage im Seitenkontext aus. deep=true liefert
+   * den vollen State, deep=false nur die aktiven Sprecher.
+   */
+  async _collectState(page, deep = true) {
+    if (!page || page.isClosed()) {
+      return deep
+        ? { inMeeting: false, meetingTitle: '', participants: [], activeSpeakers: [] }
+        : { activeSpeakers: [] };
+    }
+    return await page.evaluate(({ src, helperSrc, deep }) => {
+      const collect = new Function('return (' + src + ')')();
+      const helpers = new Function('return (' + helperSrc + ')')();
+      return collect(deep, helpers);
+    }, {
+      src: collectMeetingStateInPage.toString(),
+      helperSrc: materializeInPageHelpersSrc(),
+      deep
+    }).catch(() => deep
+      ? { inMeeting: false, meetingTitle: '', participants: [], activeSpeakers: [] }
+      : { activeSpeakers: [] });
+  }
+
+  /**
    * Scans current page DOM to detect if Teams is inside an active meeting or call.
    */
   async inspectMeeting(page) {
-    if (!page || page.isClosed()) {
-      return { inMeeting: false, meetingTitle: '', participants: [], activeSpeakers: [] };
-    }
-
-    return await page.evaluate(() => {
-      // Common indicators for active call in Teams v2 web client
-      const callControls = document.querySelector(
-        '[data-tid="call-controls"], [data-tid="hangup-button"], [data-tid="calling-screen"], div[id*="calling-stage"], button[aria-label*="Auflegen"], button[aria-label*="Leave"], button[aria-label*="Verlassen"]'
-      );
-
-      const inMeeting = !!callControls;
-      let meetingTitle = '';
-
-      const titleEl = document.querySelector(
-        '[data-tid="calling-header-title"], [data-tid="call-title"], [data-tid="header-meeting-title"], h1[data-tid*="meeting"]'
-      );
-      if (titleEl) {
-        meetingTitle = (titleEl.innerText || titleEl.textContent || '').trim();
-      }
-      if (!meetingTitle) {
-        const docTitle = document.title || '';
-        const match = docTitle.match(/^(.+?)\\s*\\|\\s*Microsoft Teams/i);
-        if (match && !match[1].toLowerCase().includes('chat')) {
-          meetingTitle = match[1].trim();
-        }
-      }
-
-      // Collect participants visible in stage/roster
-      const participantEls = document.querySelectorAll(
-        '[data-tid="roster-avatar-name"], [data-tid="calling-participant-stream"] [aria-label], [data-tid="video-tile"] [aria-label]'
-      );
-      const participantSet = new Set();
-      for (const el of participantEls) {
-        const name = (el.innerText || el.getAttribute('aria-label') || '').trim();
-        if (name && name.length < 50 && !name.includes('\\n')) {
-          participantSet.add(name);
-        }
-      }
-
-      // Detect active speakers
-      const activeSpeakerEls = document.querySelectorAll(
-        '[data-tid="active-speaker-border"], [data-is-speaking="true"], [data-speaker-state="speaking"], .speaking, [class*="activeSpeaker"], [class*="active-speaker"], [aria-label*="spricht"], [aria-label*="speaking"]'
-      );
-
-      const activeSpeakers = new Set();
-      for (const el of activeSpeakerEls) {
-        let speakerName = '';
-        const nameNode = el.querySelector('[data-tid="roster-avatar-name"], [data-tid="video-tile-name"], [class*="name"]');
-        if (nameNode) {
-          speakerName = nameNode.innerText || nameNode.textContent || '';
-        }
-        if (!speakerName) {
-          const aria = el.getAttribute('aria-label') || '';
-          const m = aria.match(/^(.+?)(?:\\s+(?:spricht|is speaking)|\\s*\\(.*\\))/i);
-          if (m) speakerName = m[1];
-        }
-        if (!speakerName) {
-          const parent = el.closest('[data-tid*="participant"], [data-tid*="tile"]');
-          if (parent) {
-            const pName = parent.querySelector('[data-tid="roster-avatar-name"], [data-tid="video-tile-name"]');
-            if (pName) speakerName = pName.innerText || pName.textContent || '';
-          }
-        }
-        if (speakerName) {
-          activeSpeakers.add(speakerName.trim());
-        }
-      }
-
-      return {
-        inMeeting,
-        meetingTitle: meetingTitle || 'Teams Meeting',
-        participants: Array.from(participantSet),
-        activeSpeakers: Array.from(activeSpeakers)
-      };
-    }).catch(() => ({
-      inMeeting: false,
-      meetingTitle: '',
-      participants: [],
-      activeSpeakers: []
-    }));
+    return await this._collectState(page, true);
   }
-
 
   /**
    * Handles the Teams pre-join screen: turns off mic + camera, clicks "Join now",
@@ -233,6 +485,7 @@ export class SpeakerTracker {
     // Click "Join now" / "Jetzt beitreten"
     const joinNowSelectors = [
       '[data-tid="prejoin-join-button"]',
+      'button[data-tid*="prejoin" i][data-tid*="join" i]',
       'button[aria-label="Jetzt beitreten"]',
       'button[aria-label="Join now"]',
       'button:has-text("Jetzt beitreten")',
@@ -277,6 +530,254 @@ export class SpeakerTracker {
   }
 
   /**
+   * Klickt das erste sichtbare Element, auf das einer der Selektoren passt.
+   * Liefert true, wenn ein Klick ausgefuehrt wurde.
+   */
+  async _clickFirstVisible(page, selectors) {
+    for (const sel of selectors) {
+      try {
+        const btn = await page.$(sel);
+        if (btn && await btn.isVisible()) {
+          await btn.click();
+          return true;
+        }
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  /**
+   * Text-basierter Fallback: sucht klickbare Elemente (role=button/a), deren
+   * aria-label oder Textinhalt eines der Regex-Muster erfuellt, und klickt das
+   * erste sichtbare. Robust gegen geaenderte data-tids (kosmetische DOM-Updates).
+   */
+  async _clickByText(page, patterns) {
+    try {
+      const handle = await page.evaluateHandle((pats) => {
+        const regexes = pats.map((p) => new RegExp(p, 'i'));
+        const clickables = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+        for (const el of clickables) {
+          const label = (el.getAttribute('aria-label') || '') + ' ' + ((el.innerText || el.textContent || '').split('\n')[0]);
+          if (regexes.some((re) => re.test(label))) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) return el;
+          }
+        }
+        return null;
+      }, patterns);
+      const el = handle.asElement();
+      if (el) {
+        await el.click().catch(async () => { await el.click({ force: true }).catch(() => null); });
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  /**
+   * Nach einem Join-Versuch: verifizieren, dass wir WIRKLICH im Meeting sind.
+   */
+  async _verifyInMeeting(page) {
+    await page.waitForTimeout(2000);
+    const info = await this.inspectMeeting(page);
+    return info;
+  }
+
+  /**
+   * Prueft/klickt das "Aktiver Anruf"-Banner ("Zurueck zum Anruf" — erscheint,
+   * wenn derselbe Account in einem 1:1-Call auf einem anderen Geraet ist, z.B.
+   * Davids Windows-Teams-Client). Liefert Join-Ergebnis oder null.
+   */
+  async _tryJoinViaCallBanner(page) {
+    const bannerSelectors = [
+      '[data-tid="call-active-bar"] button',
+      '[data-tid="active-call-bar"] button',
+      '[data-tid*="active-call" i] button',
+      '[data-tid="call-status-bar"] button',
+      'button[aria-label*="Zurück zum Anruf" i]',
+      'button[aria-label*="Return to call" i]',
+      'button[aria-label*="Aktiver Anruf" i]',
+      '#calling-header-container button',
+    ];
+    let clicked = await this._clickFirstVisible(page, bannerSelectors);
+    if (!clicked) {
+      clicked = await this._clickByText(page, [
+        'zurück zum anruf', 'return to call', 'aktiver anruf', 'rejoin'
+      ]);
+    }
+    if (!clicked) return null;
+
+    console.log(`[SpeakerTracker] Active call banner found, clicking to join/return...`);
+    await this._handlePreJoinScreen(page);
+    const info = await this._verifyInMeeting(page);
+    if (info.inMeeting) {
+      return { joined: true, meetingTitle: info.meetingTitle || 'Aktiver Teams-Anruf', participants: info.participants };
+    }
+    return null; // Banner-Klick fuehrte nicht ins Meeting -> weitersuchen
+  }
+
+  /**
+   * Navigiert in die Kalender-App und versucht, das laufende/naechste Meeting
+   * zu betreten. Liefert Join-Ergebnis oder null.
+   */
+  async _tryJoinViaCalendar(page) {
+    console.log(`[SpeakerTracker] Scanning Teams calendar for current/next meeting...`);
+    await page.goto('https://teams.microsoft.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    // App-Shell abwarten (App-Bar rendert erst nach dem SPA-Bootstrap)
+    await page.waitForSelector('[data-tid="app-bar-chat"], [role="treeitem"], div[role="main"]', { timeout: 20000 }).catch(() => null);
+    await page.waitForTimeout(3000);
+
+    // Nach dem App-Load kann jetzt erst das "Zurueck zum Anruf"-Banner sichtbar sein
+    const viaBanner = await this._tryJoinViaCallBanner(page);
+    if (viaBanner) return viaBanner;
+
+    // Kalender in der linken App-Bar oeffnen (data-tid-Muster "app-bar-<app>" ist
+    // live-verifiziert fuer chat/teams — calendar folgt demselben Schema)
+    const calNavSelectors = [
+      '[data-tid="app-bar-calendar"]',
+      'button[data-tid="app-bar-calendar"]',
+      'button[aria-label*="Kalender" i]',
+      'button[aria-label*="Calendar" i]',
+      'a[aria-label*="Kalender" i]',
+      'a[aria-label*="Calendar" i]',
+      '[data-app-name="calendar"]',
+      'nav [title="Kalender"]',
+      'nav [title="Calendar"]',
+    ];
+    const clickedCal = await this._clickFirstVisible(page, calNavSelectors)
+      || await this._clickByText(page, ['^kalender$', '^calendar$']);
+    if (clickedCal) {
+      await page.waitForTimeout(4000); // Kalender rendert Meeting-Karten langsam
+    }
+
+    // "Beitreten"-Button auf Meeting-Karten (jetzt laufende Meetings zeigen einen)
+    const joinBtnSelectors = [
+      'button[aria-label*="Beitreten" i]',
+      'button[aria-label*="Join" i]',
+      'button:has-text("Beitreten")',
+      'button:has-text("Join")',
+      '[data-tid*="join-btn" i]',
+      '[data-tid*="joinBtn" i]',
+      '[data-tid*="join-button" i]',
+    ];
+    for (const sel of joinBtnSelectors) {
+      try {
+        const candidates = await page.$$(sel);
+        for (const btn of candidates) {
+          if (!(await btn.isVisible().catch(() => false))) continue;
+          console.log(`[SpeakerTracker] Found Join button, clicking...`);
+          await btn.click();
+          await this._handlePreJoinScreen(page);
+          const info = await this._verifyInMeeting(page);
+          if (info.inMeeting) {
+            console.log(`[SpeakerTracker] Successfully joined meeting from calendar.`);
+            return { joined: true, meetingTitle: info.meetingTitle, participants: info.participants };
+          }
+          // Klick war wirkungslos (z.B. falscher Button) -> weiteren Kandidaten probieren
+        }
+      } catch (_) {}
+    }
+
+    // Fallback: Meeting-Karte anklicken -> Detail-Pane enthaelt haeufig den Join-Button
+    const cardSelectors = [
+      '[data-tid*="calendar-event" i]',
+      '[data-tid*="meeting-card" i]',
+      '[data-tid*="event-card" i]',
+      '[role="gridcell"] [role="button"]',
+    ];
+    if (await this._clickFirstVisible(page, cardSelectors)) {
+      await page.waitForTimeout(2000);
+      if (await this._clickFirstVisible(page, joinBtnSelectors)
+        || await this._clickByText(page, ['^beitreten$', '^join$', 'jetzt beitreten', 'join now'])) {
+        await this._handlePreJoinScreen(page);
+        const info = await this._verifyInMeeting(page);
+        if (info.inMeeting) {
+          return { joined: true, meetingTitle: info.meetingTitle, participants: info.participants };
+        }
+      }
+    }
+
+    // Fallback Kalender-Link: extract a meetup-join link from the DOM
+    try {
+      const joinUrl = await page.evaluate(() => {
+        const links = Array.from(document.querySelectorAll(
+          'a[href*="meetup-join"], a[href*="/l/meetup"], a[href*="/meeting/"], a[href*="teams.microsoft.com/l/"]'
+        ));
+        return links.length > 0 ? links[0].href : null;
+      });
+
+      if (joinUrl) {
+        console.log(`[SpeakerTracker] Found meeting link in DOM, navigating...`);
+        await page.goto(joinUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await this._handlePreJoinScreen(page);
+        const info = await this._verifyInMeeting(page);
+        if (info.inMeeting) {
+          console.log(`[SpeakerTracker] Successfully joined meeting via link.`);
+          return { joined: true, meetingTitle: info.meetingTitle, participants: info.participants };
+        }
+      }
+    } catch (_) {}
+
+    return null;
+  }
+
+  /**
+   * Fallback fuer spontane 1:1 Anrufe: den obersten ECHTEN Chat aus der
+   * Chatliste ermitteln (seit dem neuen Teams-Web sind Chat-Eintraege
+   * role="treeitem", aber Section-Header wie "Copilot"/"Favoriten" stehen
+   * VOR den echten Chats im Baum — deshalb muss gefiltert werden, siehe
+   * pickRealChatPartner). Liefert Join-/Partner-Ergebnis oder null.
+   */
+  async _detectChatPartner(page) {
+    console.log(`[SpeakerTracker] No calendar meeting found. Checking recent chats for 1:1 call partner...`);
+    try {
+      // Chat-App oeffnen (data-tid app-bar-chat ist live-verifiziert, siehe
+      // teamsClient.openChatView). keyboard shortcut Control+Shift+4 ist in der
+      // neuen Web-UI unzuverlaessig und wird nur als Fallback behalten.
+      const openedChat = await this._clickFirstVisible(page, [
+        'button[data-tid="app-bar-chat"]',
+        'button[aria-label*="Chat" i]',
+        'a[aria-label*="Chat" i]',
+      ]);
+      if (!openedChat) {
+        await page.keyboard.press('Control+Shift+4').catch(() => {});
+      }
+      await page.waitForTimeout(2000);
+
+      // Alle Chat-Kandidaten in DOM-Reihenfolge sammeln. Bewusst MEHRERE
+      // Selektor-Strategien, damit kosmetische DOM-Aenderungen abgefedert sind.
+      const candidates = await page.evaluate(() => {
+        const sel = [
+          '[role="treeitem"]',
+          '[data-tid="chat-list-item"]',
+          '[data-tid*="chat-list-entry"]',
+          '[role="listitem"] [data-tid*="chat-list-entry"]',
+        ].join(', ');
+        const rows = Array.from(document.querySelectorAll(sel));
+        const out = [];
+        for (const row of rows) {
+          const nameEl = row.querySelector('[data-tid*="title" i], [class*="title" i], span[dir="auto"], h3');
+          const title = (nameEl ? (nameEl.innerText || nameEl.textContent || '') : (row.innerText || '')).split('\n')[0].trim();
+          if (title) out.push({ title });
+          if (out.length >= 40) break;
+        }
+        return out;
+      });
+
+      const partner = pickRealChatPartner(candidates);
+      if (partner) {
+        console.log(`[SpeakerTracker] Detected active/recent chat partner: '${partner}'`);
+        return { joined: false, meetingTitle: `1:1 Call ${partner}`, knownSpeakers: [partner] };
+      }
+
+      console.warn(`[SpeakerTracker] Chatliste enthaelt keinen echten Partner (nur Bots/Section-Header).`);
+    } catch (e) {
+      console.warn(`[SpeakerTracker] Could not inspect chat list: ${e.message}`);
+    }
+    return null;
+  }
+
+  /**
    * Scans Teams for a currently running meeting, spontaneous 1:1 call,
    * or upcoming calendar meeting and joins it silently (mic + cam off).
    */
@@ -292,134 +793,57 @@ export class SpeakerTracker {
       }
     } catch (_) {}
 
-    // 2. Prüfen auf aktives Call-Banner ("Zurück zum Anruf" / "Return to call" / "Beitreten")
-    const activeCallBannerSelectors = [
-      '[data-tid="call-active-bar"] button',
-      'button[aria-label*="Zurück zum Anruf" i]',
-      'button[aria-label*="Return to call" i]',
-      'button:has-text("Zurück zum Anruf")',
-      'button:has-text("Return to call")',
-      'button[aria-label*="Aktiver Anruf" i]',
-      '[data-tid*="active-call"] button',
-      '#calling-header-container button',
-    ];
+    // 2. Aktives Call-Banner ("Zurueck zum Anruf" — 1:1-Call laeuft auf anderem Geraet)
+    const viaBanner = await this._tryJoinViaCallBanner(page);
+    if (viaBanner) return viaBanner;
 
-    for (const sel of activeCallBannerSelectors) {
-      try {
-        const btn = await page.$(sel);
-        if (btn && await btn.isVisible()) {
-          console.log(`[SpeakerTracker] Found active call banner, clicking to join/return...`);
-          await btn.click();
-          await this._handlePreJoinScreen(page);
-          const info = await this.inspectMeeting(page);
-          return { joined: true, meetingTitle: info.meetingTitle || 'Aktiver Teams-Anruf', participants: info.participants };
-        }
-      } catch (_) {}
-    }
+    // 3. Kalender (geplante Termine) — inkl. Banner-Recheck nach App-Load
+    const viaCalendar = await this._tryJoinViaCalendar(page);
+    if (viaCalendar) return viaCalendar;
 
-    // 3. Kalender prüfen (für geplante Termine)
-    console.log(`[SpeakerTracker] Scanning Teams calendar for current/next meeting...`);
-    await page.goto('https://teams.microsoft.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(2500);
-
-    // Try clicking the Calendar icon in the left nav
-    const calNavSelectors = [
-      '[data-tid="app-bar-calendar"]',
-      'button[aria-label="Kalender"]',
-      'button[aria-label="Calendar"]',
-      'a[aria-label="Kalender"]',
-      'a[aria-label="Calendar"]',
-      '[data-app-name="calendar"]',
-      'nav [title="Kalender"]',
-      'nav [title="Calendar"]',
-    ];
-    for (const sel of calNavSelectors) {
-      try {
-        await page.click(sel, { timeout: 3000 });
-        await page.waitForTimeout(2000);
-        break;
-      } catch (_) {}
-    }
-
-    // Look for a "Join" button on today's meeting cards (meetings happening now show one)
-    const joinBtnSelectors = [
-      'button[aria-label*="Beitreten"]',
-      'button[aria-label*="Join"]',
-      'button:has-text("Beitreten")',
-      'button:has-text("Join")',
-      '[data-tid*="join-btn"]',
-      '[data-tid*="joinBtn"]',
-    ];
-
-    for (const sel of joinBtnSelectors) {
-      try {
-        const btn = await page.$(sel);
-        if (btn && await btn.isVisible()) {
-          console.log(`[SpeakerTracker] Found Join button, clicking...`);
-          await btn.click();
-          await this._handlePreJoinScreen(page);
-          console.log(`[SpeakerTracker] Successfully joined meeting from calendar.`);
-          const info = await this.inspectMeeting(page);
-          return { joined: true, meetingTitle: info.meetingTitle, participants: info.participants };
-        }
-      } catch (_) {}
-    }
-
-    // Fallback Kalender-Link: extract a meetup-join link from the DOM
-    try {
-      const joinUrl = await page.evaluate(() => {
-        const links = Array.from(document.querySelectorAll('a[href*="meetup-join"], a[href*="teams.microsoft.com/l/"]'));
-        return links.length > 0 ? links[0].href : null;
-      });
-
-      if (joinUrl) {
-        console.log(`[SpeakerTracker] Found meeting link in DOM, navigating...`);
-        await page.goto(joinUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await this._handlePreJoinScreen(page);
-        console.log(`[SpeakerTracker] Successfully joined meeting via link.`);
-        const info = await this.inspectMeeting(page);
-        return { joined: true, meetingTitle: info.meetingTitle, participants: info.participants };
-      }
-    } catch (_) {}
-
-    // 4. Fallback für spontane 1:1 Anrufe: Letzten aktiven Chat prüfen
-    console.log(`[SpeakerTracker] No calendar meeting found. Checking recent chats for 1:1 call partner...`);
-    try {
-      await page.keyboard.press('Control+Shift+4'); // Chat-App
-      await page.waitForTimeout(2000);
-
-      // Ermittle den obersten Chat in der Liste
-      const topChatInfo = await page.evaluate(() => {
-        const chatRows = document.querySelectorAll('[role="listitem"] [data-tid*="chat-list-entry"], [role="treeitem"], [data-tid="chat-list-item"]');
-        if (chatRows.length > 0) {
-          const first = chatRows[0];
-          const nameEl = first.querySelector('[data-tid*="title"], [class*="title"], span[dir="auto"], h3');
-          const title = (nameEl ? (nameEl.innerText || nameEl.textContent) : first.innerText || '').split('\n')[0].trim();
-          return { title };
-        }
-        return null;
-      });
-
-      if (topChatInfo && topChatInfo.title) {
-        const cleanName = cleanSpeakerName(topChatInfo.title);
-        // Bots/UI-Pseudo-Einträge (z.B. "Copilot") sind NIE ein echter 1:1-Gesprächspartner.
-        // Statt einen erfundenen Partner zu liefern, melden wir lieber "unbekannt",
-        // damit downstream keine Falsch-Zuordnung der Gegenseite entsteht.
-        if (isBotOrUiName(cleanName)) {
-          console.warn(
-            `[SpeakerTracker] Oberster Chat '${cleanName}' ist ein Bot/UI-Eintrag – keine 1:1-Zuordnung.`
-          );
-          return { joined: false, meetingTitle: '1:1 Call (unbekannter Partner)', knownSpeakers: [] };
-        }
-        console.log(`[SpeakerTracker] Detected active/recent chat partner: '${cleanName}'`);
-        return { joined: false, meetingTitle: `1:1 Call ${cleanName}`, knownSpeakers: [cleanName] };
-      }
-    } catch (e) {
-      console.warn(`[SpeakerTracker] Could not inspect chat list: ${e.message}`);
-    }
+    // 4. Fallback spontane 1:1 Calls: obersten echten Chat ermitteln
+    const viaChat = await this._detectChatPartner(page);
+    if (viaChat) return viaChat;
 
     console.warn(`[SpeakerTracker] No joinable meeting or call found. Continuing without auto-join.`);
     return { joined: false, meetingTitle: 'Teams Meeting', knownSpeakers: [] };
+  }
+
+  /**
+   * Injiziert/aktualisiert den 100ms-Sampler im Seitenkontext. Bewusst
+   * idempotent: bestehende Events bleiben erhalten (kein Reset), ein alter
+   * Interval wird ersetzt. Nach Navigationen (z.B. Auto-Join-Retry) einfach
+   * erneut aufrufen.
+   */
+  async _injectSampler(page) {
+    try {
+      await page.evaluate(({ src, helperSrc }) => {
+        const collect = new Function('return (' + src + ')')();
+        const helpers = new Function('return (' + helperSrc + ')')();
+        window.__teamsSampleSpeakers = () => collect(false, helpers).activeSpeakers;
+        window.__teamsSpeakerEvents = window.__teamsSpeakerEvents || [];
+        if (window.__teamsSpeakerInterval) {
+          clearInterval(window.__teamsSpeakerInterval);
+        }
+        window.__teamsSpeakerInterval = setInterval(() => {
+          try {
+            const names = window.__teamsSampleSpeakers() || [];
+            if (names.length) {
+              const now = Date.now();
+              for (const name of names) {
+                window.__teamsSpeakerEvents.push({ speaker: name, timestamp: now });
+              }
+            }
+          } catch (e) {}
+        }, 100);
+      }, {
+        src: collectMeetingStateInPage.toString(),
+        helperSrc: materializeInPageHelpersSrc()
+      });
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   /**
@@ -434,12 +858,15 @@ export class SpeakerTracker {
     const { meetingUrl, autoJoin = true, noJoin = false, speaker = null } = options;
     let knownSpeakers = speaker ? [cleanSpeakerName(speaker)] : [];
     let detectedMeetingTitle = '';
+    let joinAttempts = 0;
 
     if (!noJoin) {
       if (meetingUrl) {
         await this.joinMeetingByUrl(page, meetingUrl);
+        joinAttempts++;
       } else if (autoJoin) {
         const joinRes = await this.findAndJoinNextMeeting(page);
+        joinAttempts++;
         if (joinRes) {
           if (joinRes.meetingTitle) detectedMeetingTitle = joinRes.meetingTitle;
           if (joinRes.knownSpeakers && joinRes.knownSpeakers.length > 0) {
@@ -453,45 +880,8 @@ export class SpeakerTracker {
     const startTimeEpochMs = Date.now();
     const samples = [];
 
-    // Inject in-page sampler
-    await page.evaluate(() => {
-      window.__teamsSpeakerEvents = [];
-      if (window.__teamsSpeakerInterval) {
-        clearInterval(window.__teamsSpeakerInterval);
-      }
-
-      window.__teamsSpeakerInterval = setInterval(() => {
-        try {
-          const activeEls = document.querySelectorAll(
-            '[data-tid="active-speaker-border"], [data-is-speaking="true"], [data-speaker-state="speaking"], .speaking, [class*="activeSpeaker"], [class*="active-speaker"], [aria-label*="spricht"], [aria-label*="speaking"]'
-          );
-          const now = Date.now();
-          for (const el of activeEls) {
-            let name = '';
-            const nameNode = el.querySelector('[data-tid="roster-avatar-name"], [data-tid="video-tile-name"], [class*="name"]');
-            if (nameNode) name = nameNode.innerText || nameNode.textContent || '';
-            if (!name) {
-              const aria = el.getAttribute('aria-label') || '';
-              const m = aria.match(/^(.+?)(?:\\s+(?:spricht|is speaking)|\\s*\\(.*\\))/i);
-              if (m) name = m[1];
-            }
-            if (!name) {
-              const parent = el.closest('[data-tid*="participant"], [data-tid*="tile"]');
-              if (parent) {
-                const pName = parent.querySelector('[data-tid="roster-avatar-name"], [data-tid="video-tile-name"]');
-                if (pName) name = pName.innerText || pName.textContent || '';
-              }
-            }
-            if (name) {
-              window.__teamsSpeakerEvents.push({
-                speaker: name.trim(),
-                timestamp: now
-              });
-            }
-          }
-        } catch (e) {}
-      }, 100);
-    }).catch(() => null);
+    // In-page sampler injizieren (100ms)
+    await this._injectSampler(page);
 
     // Node polling loop to retrieve samples periodically from the browser context
     const pollInterval = setInterval(async () => {
@@ -512,12 +902,50 @@ export class SpeakerTracker {
       } catch (e) {}
     }, 500);
 
+    // Auto-Join-Retry: Der Tracker startet ZUSAMMEN mit der Aufnahme — der echte
+    // Anruf/Meeting-Join von David kann SEKUNDEN bis MINUTEN spaeter beginnen.
+    // Ohne Retry bliebe der Tracker fuerever ausserhalb des Meetings (exakt das
+    // Ausfallbild der leeren Timelines). Retry nur solange keine Samples vorliegen.
+    let lastInMeeting = meetingInfo.inMeeting;
+    let lastJoinCheck = startTimeEpochMs;
+    const retryJoinInterval = setInterval(async () => {
+      try {
+        const session = this.activeSessions.get(tenant);
+        if (!session || page.isClosed()) {
+          clearInterval(retryJoinInterval);
+          return;
+        }
+        if (samples.length > 0 || joinAttempts >= 12) {
+          clearInterval(retryJoinInterval);
+          return;
+        }
+        const full = await this.inspectMeeting(page);
+        lastInMeeting = full.inMeeting;
+        lastJoinCheck = Date.now();
+        if (full.inMeeting) return; // drin, aber noch keine aktiven Sprecher -> abwarten
+        joinAttempts++;
+        console.log(`[SpeakerTracker] Auto-Join-Retry #${joinAttempts} (keine Samples, nicht im Meeting)...`);
+        const joinRes = await this.findAndJoinNextMeeting(page);
+        if (joinRes) {
+          if (joinRes.meetingTitle && (!session.meetingTitle || session.meetingTitle === 'Teams Meeting' || session.meetingTitle.startsWith('1:1 Call (unbekannter'))) {
+            session.meetingTitle = joinRes.meetingTitle;
+          }
+          if (joinRes.knownSpeakers && joinRes.knownSpeakers.length > 0) {
+            session.knownSpeakers = Array.from(new Set([...(session.knownSpeakers || []), ...joinRes.knownSpeakers]));
+          }
+        }
+        // Navigation beim Join-Versuch kann den In-Page-Sampler gekillt haben -> neu injizieren
+        await this._injectSampler(page);
+      } catch (e) {}
+    }, 45000);
+
     const session = {
       tenant,
       page,
       startTimeEpochMs,
       outputPath,
       pollInterval,
+      retryJoinInterval,
       samples,
       meetingTitle: detectedMeetingTitle || meetingInfo.meetingTitle || 'Teams Meeting',
       knownSpeakers
@@ -548,6 +976,9 @@ export class SpeakerTracker {
     if (session.pollInterval) {
       clearInterval(session.pollInterval);
     }
+    if (session.retryJoinInterval) {
+      clearInterval(session.retryJoinInterval);
+    }
 
     const { page, startTimeEpochMs, outputPath, samples, meetingTitle } = session;
     this.activeSessions.delete(tenant);
@@ -573,7 +1004,7 @@ export class SpeakerTracker {
     const endTimeEpochMs = Date.now();
     const durationSec = Math.max(0, (endTimeEpochMs - startTimeEpochMs) / 1000);
 
-    // Aggregate samples into clean intervals
+    // Aggregate samples into clean intervals (aggregateEvents filtert Bots bereits raus)
     const intervals = aggregateEvents(samples, {
       minGapMs: 400,
       minDurationMs: 250,
