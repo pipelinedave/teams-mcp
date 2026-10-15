@@ -96,6 +96,63 @@ describe('pickChatRow - Chat-Auswahl-Logik', () => {
   });
 });
 
+describe('Strict-Chat-Auflösung (Fix T1, 15.10.2026 - Fehl-Chat "Spieker, Leonie" -> "Messe, Adrian")', () => {
+  const liste = [
+    { row: 'r0', title: 'Messe, Adrian', text: 'Messe, Adrian' },
+    { row: 'r1', title: 'Leonie Spieker', text: 'Leonie Spieker' },
+    { row: 'r2', title: 'Spieker, Leonie', text: 'Spieker, Leonie' },
+    { row: 'r3', title: 'Projektraum X', text: 'Projektraum X' }
+  ];
+
+  test('normalizeChatTitle: case-insensitive, trim, "(you)" entfernt', () => {
+    assert.equal(TeamsClient.normalizeChatTitle('  Leonie  Spieker (you) '), 'leonie spieker');
+  });
+
+  test('chatTitleVariants: "Nachname, Vorname" und "Vorname Nachname" gleichwertig', () => {
+    const v = [...TeamsClient.chatTitleVariants('Spieker, Leonie')];
+    assert.ok(v.includes('spieker, leonie'));
+    assert.ok(v.includes('leonie spieker'));
+  });
+
+  test('exakter Match case-insensitive + trim', () => {
+    const r = TeamsClient.resolveChatRowStrict(liste, '  messe, adrian ');
+    assert.equal(r.title, 'Messe, Adrian');
+  });
+
+  test('INCIDENT-FALL: "Spieker, Leonie" findet "Leonie Spieker" (Swap-Äquivalenz)', () => {
+    const r = TeamsClient.resolveChatRowStrict(liste, 'Spieker, Leonie');
+    assert.ok(r, 'Swap-Match muss greifen');
+    assert.ok(['Leonie Spieker', 'Spieker, Leonie'].includes(r.title));
+  });
+
+  test('KEIN nearest-match: nicht enthaltener Name -> null (Fehlerpfad mit Kandidaten greift)', () => {
+    assert.equal(TeamsClient.resolveChatRowStrict(liste, 'Müller, Heinz'), null);
+    // Teilweise passende Tokens reichen NICHT (früher: stille Fehlauflösung)
+    assert.equal(TeamsClient.resolveChatRowStrict(liste, 'Spieker'), null);
+  });
+
+  test('fuzzyChatCandidates: Token-Treffer als Kandidatenliste für Fehlermeldung', () => {
+    const c = TeamsClient.fuzzyChatCandidates(liste, 'Spieker, Leonie');
+    assert.ok(c.length >= 1);
+    assert.ok(c.some((t) => t.includes('Spieker')));
+  });
+
+  test('chatTitlesConsistent: Incident-Kombination wird VERWORFEN', () => {
+    assert.equal(TeamsClient.chatTitlesConsistent('Spieker, Leonie', 'Messe, Adrian'), false);
+  });
+
+  test('chatTitlesConsistent: konsistente Kombinationen (exakt, Swap, Token-ALL)', () => {
+    assert.equal(TeamsClient.chatTitlesConsistent('Spieker, Leonie', 'Spieker, Leonie'), true);
+    assert.equal(TeamsClient.chatTitlesConsistent('Spieker, Leonie', 'Leonie Spieker'), true);
+    assert.equal(TeamsClient.chatTitlesConsistent('Projektraum X', 'Projektraum X (you)'), true);
+  });
+
+  test('chatTitlesConsistent: TOKEN-ALL statt matchAny — ein geteilter Name reicht NICHT', () => {
+    // matchAny-Falle des alten Safety-Nets: nur "leonie" gemeinsam -> früher true
+    assert.equal(TeamsClient.chatTitlesConsistent('Spieker, Leonie', 'Leonie Messe'), false);
+  });
+});
+
 describe('normalizeTenant / realm - Org-neutrale Tenant-Logik', () => {
   test('exakter konfigurierter Key', () => {
     assert.equal(browserManager.normalizeTenant('adesso'), 'adesso');

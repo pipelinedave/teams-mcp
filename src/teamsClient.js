@@ -215,6 +215,17 @@ export class TeamsClient {
     let exact = filtered.find(c => c.title.toLowerCase() === term);
     if (exact) return { row: exact.row, title: exact.title };
 
+    // 1b) "Nachname, Vorname" <-> "Vorname Nachname" (Fix T1, 15.10.2026:
+    // chat_name "Spieker, Leonie" fand den Chat "Leonie Spieker" nicht)
+    exact = filtered.find(c => {
+      const t = c.title.toLowerCase().replace(/\s+/g, ' ').trim();
+      const swap = term.match(/^(.+),\s+(.+)$/);
+      if (swap) return t === `${swap[2]} ${swap[1]}` || t === term;
+      const tSwap = t.match(/^(.+),\s+(.+)$/);
+      return tSwap ? term === `${tSwap[2]} ${tSwap[1]}` : false;
+    });
+    if (exact) return { row: exact.row, title: exact.title };
+
     // 2) Titel beginnt mit dem Suchbegriff (z.B. "Yannick" -> "Yannick Bülter")
     let prefix = filtered.find(c => c.title.toLowerCase().startsWith(term));
     if (prefix) return { row: prefix.row, title: prefix.title };
@@ -230,6 +241,86 @@ export class TeamsClient {
     }
 
     return null;
+  }
+
+  // --- STRICT-CHAT-AUFLÖSUNG (Fix T1, 15.10.2026) ----------------------------
+  // Root Cause des Fehl-Chat-Incidents: getMessages lieferte bei chat_name ohne
+  // Listen-Treffer (pickChatRow -> null) KEINEN Klick aus und scannte
+  // stillschweigend den AKTUELL geöffneten Chat — Anfrage "Spieker, Leonie"
+  // lieferte den Verlauf von "Messe, Adrian". getMessages nutzt deshalb die
+  // strikte Auflösung: exakter Match (case-insensitive, trim, inkl.
+  // "Nachname, Vorname"-Variante) oder KLARER FEHLER mit Kandidatenliste.
+  // sendMessage behält die tolerantere pickChatRow (Safety-Net + Adressbuch-
+  // Fallback + Versand-Gate absichern den Rest).
+
+  // Normalform eines Chat-Titels: case-insensitive, trim, Whitespace konsolidiert,
+  // "(you)"-Suffix entfernt (Eigene-Chat-Markierung der Teams-Liste).
+  static normalizeChatTitle(t) {
+    return String(t || '')
+      .replace(/\s*\(you\)\s*$/i, '')
+      .toLowerCase()
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  // Alle als gleichwertig behandelten Schreibweisen eines Titels:
+  // Normalform + "Nachname, Vorname"-Swap (deutsche Telefonbuch-Ordnung).
+  static chatTitleVariants(t) {
+    const norm = TeamsClient.normalizeChatTitle(t);
+    const variants = new Set([norm]);
+    const swap = norm.match(/^(.+),\s+(.+)$/);
+    if (swap) variants.add(`${swap[2]} ${swap[1]}`.trim());
+    return variants;
+  }
+
+  // Exakte (case-insensitive, trim) Auflösung eines chat_name gegen die
+  // gefilterte Chatliste. Kein nearest-match: null = "nicht eindeutig gefunden".
+  static resolveChatRowStrict(filtered, chatName) {
+    if (!chatName) return null;
+    const queryVariants = TeamsClient.chatTitleVariants(chatName);
+    const exact = filtered.find((c) => {
+      const titleVariants = TeamsClient.chatTitleVariants(c.title);
+      for (const q of queryVariants) {
+        if (titleVariants.has(q)) return true;
+      }
+      return false;
+    });
+    return exact ? { row: exact.row, title: exact.title } : null;
+  }
+
+  // Kandidatenliste für Fehler-Returns: zuerst Titel, die alle Begriffe (>=3
+  // Zeichen, Komma-bereinigt) enthalten, sonst die ersten N Listeneinträge.
+  static fuzzyChatCandidates(filtered, chatName, limit = 12) {
+    const tokens = TeamsClient.normalizeChatTitle(chatName)
+      .replace(/,/g, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length >= 3);
+    const fuzzy = tokens.length
+      ? filtered.filter((c) => {
+          const t = TeamsClient.normalizeChatTitle(c.title).replace(/,/g, ' ');
+          return tokens.every((tok) => t.includes(tok));
+        })
+      : [];
+    const source = fuzzy.length ? fuzzy : filtered;
+    return source.slice(0, limit).map((c) => c.title);
+  }
+
+  // Vereinheitlichtes Safety-Net: Passt der tatsächlich geöffnete Chat-Titel zum
+  // Ziel? Ersetzt die früheren drei kopierten Inline-Blöcke (getMessages/
+  // sendMessage) durch EINE komma-tolerante Prüfung. Bewusst TOKEN-ALL (alle
+  // Begriffe müssen vorkommen) statt matchAny — "Spieker, Leonie" darf nicht auf
+  // einen Chat passen, der nur "Leonie" enthält.
+  static chatTitlesConsistent(targetTitle, activeTitle) {
+    const a = TeamsClient.normalizeChatTitle(activeTitle);
+    if (!a) return false;
+    for (const v of TeamsClient.chatTitleVariants(targetTitle)) {
+      if (a === v || a.includes(v) || v.includes(a)) return true;
+    }
+    const tokens = TeamsClient.normalizeChatTitle(targetTitle)
+      .replace(/,/g, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length >= 3);
+    return tokens.length > 0 && tokens.every((tok) => a.includes(tok));
   }
 
   async listChats(tenant = '', limit = 15) {
@@ -751,32 +842,48 @@ export class TeamsClient {
     }
 
     let picked = null;
-    if (typeof chatIndex === 'number' || chatName) {
-      picked = this.pickChatRow(filtered, chatName, chatIndex);
-      if (picked) {
-        await picked.row.click();
-        await page.waitForTimeout(2500);
+    if (typeof chatIndex === 'number') {
+      // chat_index wird EXPLIZIT validiert — out-of-range darf nicht still in den
+      // aktuell geöffneten Chat fallen (zweiter Silent-Wrong-Chat-Pfad).
+      if (chatIndex < 0 || chatIndex >= filtered.length) {
+        throw new Error(
+          `chat_index ${chatIndex} ist außerhalb der Chatliste (${filtered.length} Einträge). ` +
+          `Gültige Indizes: 0..${Math.max(0, filtered.length - 1)}. Liste via teams_list_chats abrufen.`
+        );
       }
+      picked = { row: filtered[chatIndex].row, title: filtered[chatIndex].title };
+      await picked.row.click();
+      await page.waitForTimeout(2500);
+    } else if (chatName) {
+      // STRICT-Auflösung (Fix T1, 15.10.2026): exakter Match (case-insensitive,
+      // trim, inkl. "Nachname, Vorname"-Variante) oder klarer Fehler mit
+      // Kandidatenliste — NIEMALS nearest-match, NIEMALS stillschweigend der
+      // aktuell geöffnete Chat (Root Cause des Fehl-Chat-Incidents
+      // "Spieker, Leonie" -> Verlauf von "Messe, Adrian").
+      picked = TeamsClient.resolveChatRowStrict(filtered, chatName);
+      if (!picked) {
+        const candidates = TeamsClient.fuzzyChatCandidates(filtered, chatName);
+        throw new Error(
+          `Chat '${chatName}' wurde in der Chatliste nicht EINDEUTIG gefunden (exakter Match, case-insensitive, inkl. "Nachname, Vorname"-Variante). ` +
+          `Es wurden KEINE Nachrichten gelesen. Passende Kandidaten aus der aktuellen Liste: ` +
+          `${candidates.length ? candidates.map((t) => `'${t}'`).join(', ') : '(keine — Chatliste evtl. zu kurz geladen, teams_list_chats mit hoeherem limit nutzen)'}. ` +
+          `Bitte chat_name exakt wie in der Liste angeben oder chat_index verwenden.`
+        );
+      }
+      await picked.row.click();
+      await page.waitForTimeout(2500);
     }
 
     // Aktiven Chat-Titel aus dem Message-Pane verifizieren (stabil)
     const activeChat = await this.getActiveChatTitle(page);
     await page.waitForSelector('[data-tid="chat-pane-message"], [data-tid="message-body"], .fui-ChatMessage__body, .fui-ChatMyMessage__body', { timeout: 15000 }).catch(() => null);
 
-    // Sicherheitsnetz (Live-Befund 09.10.2026): Bei der nun vollstaendigen Chatliste
-    // stehen auch Nicht-Chat-Entries in der gefilterten Liste (z.B. "AC" aus der
-    // Communities-Sektion). Ein Klick darauf oeffnet KEINEN Chat — Teams bleibt im
-    // aktiven Chat, und ohne Pruefung wuerde still der FALSCHE Verlauf gescrappt
-    // (das alte Silent-Fehlresolvenz-Problem von chat_index, Spec-Befund 1).
-    // sendMessage hat dieses Netz bereits — hier zieht es getMessages nach.
-    if (picked) {
-      const targetNorm = String(picked.title || '').toLowerCase().replace(/\s*\(you\)$/i, '').trim();
-      const activeNorm = String(activeChat || '').toLowerCase().replace(/\s*\(you\)$/i, '').trim();
-      const nameParts = targetNorm.split(/\s+/).filter((p) => p.length >= 2);
-      const matchAny = nameParts.some((p) => activeNorm.includes(p));
-      if (!activeNorm.includes(targetNorm) && !targetNorm.includes(activeNorm) && !matchAny) {
-        throw new Error(`Sicherheitsnetz: Der geöffnete Chat '${activeChat}' stimmt nicht mit dem Ziel '${picked.title}' überein. Es wurden KEINE Nachrichten des Ziel-Chats gelesen. (Der Eintrag ist vermutlich kein klickbarer Chat — pruefe die vollständige Liste via teams_list_chats mit hoeherem limit.)`);
-      }
+    // Sicherheitsnetz (Live-Befund 09.10.2026 + Fix T1 15.10.2026): Der tatsächlich
+    // geöffnete Chat muss zum Ziel passen — sonst wäre ein stiller Fehl-Verlauf
+    // möglich (Klick auf Nicht-Chat-Entry oder Teams hat nicht gewechselt).
+    // chatTitlesConsistent prüft komma-tolerant mit TOKEN-ALL (nicht matchAny).
+    if (picked && !TeamsClient.chatTitlesConsistent(picked.title, activeChat)) {
+      throw new Error(`Sicherheitsnetz: Der geöffnete Chat '${activeChat}' stimmt nicht mit dem Ziel '${picked.title}' überein. Es wurden KEINE Nachrichten des Ziel-Chats gelesen. (Der Eintrag ist vermutlich kein klickbarer Chat — pruefe die vollständige Liste via teams_list_chats mit hoeherem limit.)`);
     }
 
     // Befund 12.10.2026 (moveAI-Anhaenge): Teams stellt beim Chat-Oeffnen die
@@ -801,7 +908,10 @@ export class TeamsClient {
 
     return {
       tenant: t,
+      // T1: `chat` ist IMMER der tatsächlich gelesene Chat (Header des Message-Panes),
+      // `requestedChat` der angefragte Name — Agenten können Abweichung direkt erkennen.
       chat: activeChat,
+      requestedChat: chatName || (typeof chatIndex === 'number' ? `index:${chatIndex}` : undefined),
       count: messages.length,
       messages,
       ...(downloads ? { downloads } : {})
@@ -1814,12 +1924,9 @@ export class TeamsClient {
 
     const activeChat = await this.getActiveChatTitle(page);
 
-    // Verifizieren, dass der aktive Chat dem Ziel entspricht (Sicherheitsnetz)
-    const targetNorm = picked.title.toLowerCase().replace(/ \(you\)$/i, '');
-    const activeNorm = activeChat.toLowerCase().replace(/ \(you\)$/i, '');
-    const nameParts = targetNorm.split(/\s+/).filter(p => p.length > 2);
-    const matchAny = nameParts.some(p => activeNorm.includes(p));
-    if (!activeNorm.includes(targetNorm) && !targetNorm.includes(activeNorm) && !matchAny) {
+    // Verifizieren, dass der aktive Chat dem Ziel entspricht (Sicherheitsnetz,
+    // vereinheitlicht via chatTitlesConsistent — Fix T1 15.10.2026)
+    if (!TeamsClient.chatTitlesConsistent(picked.title, activeChat)) {
       throw new Error(`Sicherheitsnetz: Der geöffnete Chat-Titel '${activeChat}' stimmt nicht mit Ziel '${picked.title}' überein. Nachricht wurde NICHT gesendet.`);
     }
 
