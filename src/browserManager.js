@@ -6,7 +6,36 @@ import { config } from './config.js';
 
 class BrowserManager {
   constructor() {
-    this.instances = new Map(); // tenant -> { context, page, isHeadless }
+    this.instances = new Map(); // tenant -> { context, page, isHeadless, lastUsed }
+    // Idle-Unload (2026-10-20): Browser je Tenant nach N Minuten ohne Tool-Call
+    // schliessen. Profil bleibt erhalten -> naechster Call startet lazy neu (Login bleibt).
+    // 0 = deaktiviert (alter Zustand: Browser bleibt bis close/Restart offen).
+    this.idleMinutes = Number.parseInt(process.env.TEAMS_MCP_BROWSER_IDLE_MIN ?? '30', 10);
+    this.idleTimer = null;
+    this.startIdleReaper();
+  }
+
+  startIdleReaper() {
+    if (!Number.isFinite(this.idleMinutes) || this.idleMinutes <= 0) return;
+    const idleMs = this.idleMinutes * 60_000;
+    this.idleTimer = setInterval(() => { void this.reapIdle(idleMs); }, 60_000);
+    if (typeof this.idleTimer.unref === 'function') this.idleTimer.unref();
+  }
+
+  async reapIdle(idleMs) {
+    const now = Date.now();
+    for (const [t, inst] of [...this.instances.entries()]) {
+      if (!inst?.context) continue;
+      if (now - (inst.lastUsed || 0) < idleMs) continue;
+      if (this.instances.get(t) !== inst) continue;
+      // Vor close austragen: eine parallele ensureContext darf den NEUEN Eintrag
+      // nicht durch das nachgelagerte delete verlieren.
+      this.instances.delete(t);
+      try {
+        await inst.context.close();
+      } catch (e) {}
+      console.error(`[teams-mcp] idle-unload: Browser fuer Tenant '${t}' nach ${this.idleMinutes} min Inaktivitaet geschlossen`);
+    }
   }
 
   normalizeTenant(tenant) {
@@ -79,6 +108,7 @@ class BrowserManager {
       } else {
         try {
           if (existing.page && !existing.page.isClosed()) {
+            existing.lastUsed = Date.now(); // Idle-Timer zuruecksetzen
             return { context: existing.context, page: existing.page };
           }
         } catch (e) {}
@@ -120,7 +150,7 @@ class BrowserManager {
 
     const pages = context.pages();
     const page = pages.length > 0 ? pages[0] : await context.newPage();
-    this.instances.set(t, { context, page, isHeadless: headless });
+    this.instances.set(t, { context, page, isHeadless: headless, lastUsed: Date.now() });
     return { context, page };
   }
 
