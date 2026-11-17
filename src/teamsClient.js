@@ -2134,11 +2134,17 @@ export class TeamsClient {
     }
 
     await this.dismissOverlays(page);
-    const liveSendButton = sendButton || await page.$('button[data-tid="newMessageCommands-send"], button[data-tid="send-message-button"], button[aria-label*="Send"], button[aria-label*="Senden"]');
+    // Button immer frisch abfragen, da Texteingabe/Paste die Fluent-Toolbar neu rendern kann (DOM-Detachment)
+    const liveSendButton = await page.$('button[data-tid="newMessageCommands-send"], button[data-tid="send-message-button"], button[aria-label*="Send"], button[aria-label*="Senden"]');
     if (liveSendButton) {
       await liveSendButton.click().catch(async () => {
         await this.dismissOverlays(page);
-        await liveSendButton.click({ force: true });
+        const retryBtn = await page.$('button[data-tid="newMessageCommands-send"], button[data-tid="send-message-button"], button[aria-label*="Send"], button[aria-label*="Senden"]');
+        if (retryBtn) {
+          await retryBtn.click({ force: true });
+        } else {
+          await page.keyboard.press('Enter');
+        }
       });
     } else {
       await page.keyboard.press('Enter');
