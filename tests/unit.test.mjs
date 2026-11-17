@@ -2319,3 +2319,87 @@ describe('pickerElementMatches - Picker-Eintrag vs. Zielreaktion', () => {
     assert.equal(pickerElementMatches(makePickerEl({ ariaLabel: '' }), tgt), false);
   });
 });
+
+// ============================================================================
+// Send-Sicherheit B1-B5 (17.11.2026) — Incident "Lena and Niklas" -> "adessi @ d.velop"
+// Root Cause: sendMessage nutzte Fuzzy-pickChatRow + startNewChat mit Blind-First
+// (erste Suggestion wurde geklickt). Neue STRICT-Helfer muessen den Incident
+// reproduzierbar Fehlschlagen lassen.
+// ============================================================================
+describe('chatTitleExactMatch - STRICT-Equality fürs Pre-Send-Gate (B3)', () => {
+  test('INCIDENT: "Lena and Niklas" matcht NICHT "adessi @ d.velop"', () => {
+    assert.equal(TeamsClient.chatTitleExactMatch('Lena and Niklas', 'adessi @ d.velop'), false);
+    assert.equal(TeamsClient.chatTitleExactMatch('adessi @ d.velop', 'Lena and Niklas'), false);
+  });
+
+  test('exakt (case-insensitive, trim, Whitespace konsolidiert)', () => {
+    assert.equal(TeamsClient.chatTitleExactMatch('Yannick Bülter', '  yannick   bülter '), true);
+  });
+
+  test('"Nachname, Vorname"-Variante matcht die Vorname-Nachname-Form', () => {
+    assert.equal(TeamsClient.chatTitleExactMatch('Spieker, Leonie', 'Leonie Spieker'), true);
+  });
+
+  test('kein Teilstring-Treffer: "Lena" matcht NICHT "Team Lena"', () => {
+    assert.equal(TeamsClient.chatTitleExactMatch('Lena', 'Team Lena'), false);
+    assert.equal(TeamsClient.chatTitleExactMatch('Lena and Niklas', 'Lena and Niklas Backup'), false);
+  });
+
+  test('leerer/fehlender aktiver Titel -> false (kein false-positive)', () => {
+    assert.equal(TeamsClient.chatTitleExactMatch('Lena and Niklas', ''), false);
+    assert.equal(TeamsClient.chatTitleExactMatch('Lena and Niklas', null), false);
+  });
+
+  test('(you)-Suffix des Eigennamens wird entfernt', () => {
+    assert.equal(TeamsClient.chatTitleExactMatch('David Hallmann', 'David Hallmann (you)'), true);
+  });
+});
+
+describe('suggestionOptionMatches - STRICT-Adressbuch-Suggest (B2, kein Blind-First)', () => {
+  test('INCIDENT: GAL-Suggest "adessi @ d.velop" matcht NICHT "Lena and Niklas"', () => {
+    assert.equal(TeamsClient.suggestionOptionMatches('adessi @ d.velop', 'Lena and Niklas'), false);
+  });
+
+  test('exakte Gruppe matcht', () => {
+    assert.equal(TeamsClient.suggestionOptionMatches('Lena and Niklas', 'Lena and Niklas'), true);
+  });
+
+  test('Komma-Anzeige im Chip ("Niklas, Lena") matcht Gruppen-Eingabe', () => {
+    assert.equal(TeamsClient.suggestionOptionMatches('Niklas, Lena', 'Lena and Niklas'), true);
+  });
+
+  test('Stopword-Toleranz: "und"-Schreibweise matcht "and"-Eingabe', () => {
+    assert.equal(TeamsClient.suggestionOptionMatches('Lena und Niklas', 'Lena and Niklas'), true);
+  });
+
+  test('Vorname-only-Eingabe matcht den vollen Suggest-Namen', () => {
+    assert.equal(TeamsClient.suggestionOptionMatches('Lena Meier', 'Lena'), true);
+  });
+
+  test('fremde Person matcht NICHT', () => {
+    assert.equal(TeamsClient.suggestionOptionMatches('Adrian Messe', 'Lena and Niklas'), false);
+  });
+
+  test('leere/unvollständige Eingaben -> false', () => {
+    assert.equal(TeamsClient.suggestionOptionMatches('', 'Lena'), false);
+    assert.equal(TeamsClient.suggestionOptionMatches('adessi @ d.velop', ''), false);
+    assert.equal(TeamsClient.suggestionOptionMatches(null, 'Lena'), false);
+  });
+});
+
+describe('resolveChatRowStrict - Send-Pfad (B1) muss beim Incident KLAR fehlschlagen', () => {
+  const list = [
+    { title: 'adessi @ d.velop' },
+    { title: 'Yannick Bülter' },
+    { title: 'Spieker, Leonie' }
+  ].map((c) => ({ ...c }));
+
+  test('INCIDENT: "Lena and Niklas" resolving in Liste ohne diesen Chat -> null (kein nearest-match)', () => {
+    assert.equal(TeamsClient.resolveChatRowStrict(list, 'Lena and Niklas'), null);
+  });
+
+  test('exakter Treffer in derselben Liste funktioniert weiterhin', () => {
+    assert.equal(TeamsClient.resolveChatRowStrict(list, 'ADESSI @ D.VELOP').title, 'adessi @ d.velop');
+    assert.equal(TeamsClient.resolveChatRowStrict(list, 'Leonie Spieker').title, 'Spieker, Leonie');
+  });
+});

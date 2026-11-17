@@ -248,7 +248,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'teams_send_message',
-        description: 'Sendet eine Nachricht in einen Microsoft Teams Chat (optional inklusive Dateianhängen).',
+        description: 'Sendet eine Nachricht in einen Microsoft Teams Chat (optional inklusive Dateianhängen). STRICT-Chat-Auflösung: chat_name muss exakt wie in teams_list_chats lauten (kein Fuzzy-Match, kein stiller Fallback auf den aktiven Chat). Vor dem Senden wird der geöffnete Chat gegen das Ziel verifiziert (Pre-Send-Gate). Mit dry_run: true wird nur verifiziert und gepreviewt — ohne Versand.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -258,7 +258,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             chat_name: {
               type: 'string',
-              description: 'Name des Empfänger-Chats oder Kollegen'
+              description: 'Name des Empfänger-Chats oder Kollegen — EXAKT wie in teams_list_chats (inkl. "Nachname, Vorname"-Variante). Kein Fuzzy-Match: bei Nicht-Treffer wird ein neuer Chat über das Adressbuch gestartet (mit To-Feld-Verifikation) oder klar abgebrochen.'
+            },
+            chat_index: {
+              type: 'number',
+              description: 'DEPRECATED fürs Senden — Index aus teams_list_chats. Nur noch mit Range-Validierung nutzbar; bitte chat_name verwenden.'
+            },
+            dry_run: {
+              type: 'boolean',
+              description: 'Wenn true: Chat wird STRICT aufgelöst und verifiziert (Pre-Send-Gate / To-Feld), Compose- und Send-Button werden geprüft — aber NICHTS getippt und NICHTS gesendet (Preview/Verifikation).'
             },
             attachments: {
               type: 'array',
@@ -566,6 +574,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await teamsClient.sendMessage(tenant, {
           message: args.message,
           chatName: args.chat_name,
+          chatIndex: args.chat_index,
+          dryRun: args.dry_run === true,
           attachments: rawAttachments
         });
         return {

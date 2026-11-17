@@ -268,8 +268,10 @@ export class TeamsClient {
   // lieferte den Verlauf von "Messe, Adrian". getMessages nutzt deshalb die
   // strikte Auflösung: exakter Match (case-insensitive, trim, inkl.
   // "Nachname, Vorname"-Variante) oder KLARER FEHLER mit Kandidatenliste.
-  // sendMessage behält die tolerantere pickChatRow (Safety-Net + Adressbuch-
-  // Fallback + Versand-Gate absichern den Rest).
+  // sendMessage behält bewusst den "neuer Chat über das Adressbuch"-Pfad, aber
+  // ebenfalls mit STRICT-Auflösung: Fuzzy-Fallback ist dort EBENFALLS gestrichen
+  // (Fix B1 17.11.2026, Incident "Lena and Niklas" -> Gruppen-Chat "adessi @ d.velop").
+  // Anschließendes Pre-Send-Gate (B3) verifiziert den geöffneten Chat VOR dem Senden.
 
   // Normalform eines Chat-Titels: case-insensitive, trim, Whitespace konsolidiert,
   // "(you)"-Suffix entfernt (Eigene-Chat-Markierung der Teams-Liste).
@@ -340,6 +342,40 @@ export class TeamsClient {
       .split(/\s+/)
       .filter((t) => t.length >= 3 && !STOPWORDS.has(t));
     return tokens.length > 0 && tokens.every((tok) => a.includes(tok));
+  }
+
+  // B3 (17.11.2026, Pre-Send-Gate): STRICT-Equality statt Token-ALL — der geöffnete
+  // Chat-Titel muss den Ziel-Titel EXAKT (case-insensitive, trim, inkl.
+  // "Nachname, Vorname"-Variante) ergeben. Kein 'includes', kein Token-All:
+  // "Lena and Niklas" darf nie auf "adessi @ d.velop" passen, und ein
+  // Teilstring-Treffer ("Team Lena" bei Ziel "Lena") ist ebenfalls verboten.
+  static chatTitleExactMatch(targetTitle, activeTitle) {
+    const a = TeamsClient.normalizeChatTitle(activeTitle);
+    if (!a) return false;
+    for (const v of TeamsClient.chatTitleVariants(targetTitle)) {
+      if (a === v) return true;
+    }
+    return false;
+  }
+
+  // B2 (17.11.2026, startNewChat): STRICT-Abgleich eines Adressbuch-Suggests gegen
+  // den angefragten Personennamen — ERSETZT den Blind-First-Fallback (es wurde
+  // früher schlicht die ERSTE Suggestion geklickt; Incident: "Lena and Niklas"
+  // landete im GAL-Eintrag "adessi @ d.velop"). Match = Varianten-Equality ODER
+  // Token-ALL über die Nicht-Stopword-Begriffe des Namens ("and"/"und" in
+  // Gruppen-Eingaben brechen den Vergleich nicht).
+  static suggestionOptionMatches(optionText, personName) {
+    const opt = TeamsClient.normalizeChatTitle(optionText).replace(/,/g, ' ');
+    if (!opt) return false;
+    for (const v of TeamsClient.chatTitleVariants(personName)) {
+      if (opt === v || opt === TeamsClient.normalizeChatTitle(v).replace(/,/g, ' ')) return true;
+    }
+    const STOPWORDS = new Set(['and', 'und', 'the', 'der', 'die', 'das', 'mit', 'for', 'fuer', 'at', '@']);
+    const tokens = TeamsClient.normalizeChatTitle(personName)
+      .replace(/,/g, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length >= 2 && !STOPWORDS.has(t));
+    return tokens.length > 0 && tokens.every((tok) => opt.includes(tok));
   }
 
   async listChats(tenant = '', limit = 15) {
@@ -1881,54 +1917,166 @@ export class TeamsClient {
     const count = await optionLocator.count();
     if (count === 0) return null;
 
-    // Finde passende Option
+    // B2 (17.11.2026): STRICT-Abgleich — nur eine Suggestion, die zum angefragten
+    // Namen passt, wird geklickt. KEIN Blind-First-Fallback mehr: früher wurde
+    // ohne Treffer schlicht die ERSTE Suggestion genommen (Incident: "Lena and
+    // Niklas" öffnete den GAL-Eintrag "adessi @ d.velop"). Kein Treffer -> null,
+    // der Aufrufer (sendMessage) bricht mit Kandidatenliste ab.
     let targetOption = null;
     let pickedTitle = personName;
-    const norm = personName.toLowerCase();
+    const suggestionTexts = [];
     for (let i = 0; i < count; i++) {
       const opt = optionLocator.nth(i);
       const text = (await opt.innerText().catch(() => '')) || '';
-      if (text.toLowerCase().includes(norm)) {
+      const firstLine = text.split('\n')[0].trim();
+      if (text) suggestionTexts.push(firstLine);
+      if (!targetOption && firstLine && TeamsClient.suggestionOptionMatches(firstLine, personName)) {
         targetOption = opt;
-        pickedTitle = text.split('\n')[0].trim();
-        break;
+        pickedTitle = firstLine;
       }
     }
-    if (!targetOption) {
-      targetOption = optionLocator.first();
-      const text = (await targetOption.innerText().catch(() => '')) || '';
-      if (text) pickedTitle = text.split('\n')[0].trim();
-    }
+    if (!targetOption) return null;
 
     await targetOption.click();
     await page.waitForTimeout(2500);
-    return { title: pickedTitle };
+
+    // B2: To-Well-Verifikation — nach der Auswahl MUSS ein Empfänger-Chip im
+    // To-Feld liegen, der zum Ziel passt. Sonst Compose abbrechen (Escape) und
+    // verifiziert-falsch melden, damit sendMessage KEINEN Text einsetzt.
+    const toWell = await this.verifyToWell(page, personName);
+    if (!toWell.ok) {
+      await page.keyboard.press('Escape').catch(() => {});
+      await page.waitForTimeout(400);
+      return {
+        title: pickedTitle,
+        toWellVerified: false,
+        toWellTexts: toWell.texts,
+        toWellReason: toWell.reason,
+        suggestions: suggestionTexts.slice(0, 12)
+      };
+    }
+    return { title: pickedTitle, toWellVerified: true, toWellTexts: toWell.texts };
   }
 
-  async sendMessage(tenant = '', { message, chatName, attachments } = {}) {
+  // B2 (17.11.2026): Liest die Empfänger-Chips des To-Felds im (Neu-)Chat-Compose
+  // und prüft, dass mindestens einer STRICT zum Zielpersonennamen passt.
+  // Defensive Mehrfach-Selektoren — Teams-Compose-DOM variiert je nach Version.
+  async verifyToWell(page, personName) {
+    try {
+      const texts = await page.evaluate(() => {
+        const found = new Set();
+        const chipSels = [
+          '[data-tid="tokenized-persona"]',
+          '[data-tid*="persona-chip"]',
+          '[data-tid*="recipient"] [role="listitem"]',
+          '[role="listitem"] .fui-Persona__primaryText',
+          '.ms-Persona-primaryText',
+          '[data-tid*="people-picker"] [role="option"][aria-selected="true"]'
+        ];
+        for (const sel of chipSels) {
+          document.querySelectorAll(sel).forEach((el) => {
+            const t = ((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '')).trim();
+            const first = t.split('\n')[0].trim();
+            if (first) found.add(first);
+          });
+        }
+        return Array.from(found);
+      });
+      if (!texts || texts.length === 0) {
+        return { ok: false, reason: 'Keine Empfänger-Chips im To-Feld gefunden (Selektor-Lücke? Compose evtl. nicht offen).', texts: [] };
+      }
+      const ok = texts.some((t) => (
+        TeamsClient.chatTitleExactMatch(personName, t) ||
+        TeamsClient.suggestionOptionMatches(t, personName)
+      ));
+      return { ok, reason: ok ? 'ok' : 'Kein To-Feld-Chip entspricht dem Zielpersonennamen.', texts: texts.slice(0, 12) };
+    } catch (e) {
+      return { ok: false, reason: 'To-Feld nicht lesbar: ' + (e && e.message ? e.message : String(e)), texts: [] };
+    }
+  }
+
+  async sendMessage(tenant = '', { message, chatName, chatIndex, dryRun, attachments } = {}) {
     if (!message) throw new Error("Nachrichtentext (message) ist erforderlich.");
-    if (!chatName) throw new Error("Empfänger (chat_name) ist erforderlich. Es wird bewusst nicht in einen unbestimmten 'aktiven' Chat gesendet.");
+    if (!chatName && typeof chatIndex !== 'number') {
+      throw new Error("Empfänger (chat_name) ist erforderlich. Es wird bewusst nicht in einen unbestimmten 'aktiven' Chat gesendet.");
+    }
     const validAttachments = this.validateAttachments(attachments);
     const t = browserManager.normalizeTenant(tenant);
     const page = await this.getPage(t, true);
 
     const filtered = await this.getFilteredChatRows(page);
 
-    let picked = this.pickChatRow(filtered, chatName, undefined);
-    if (!picked) {
-      // Chat nicht in den geladenen Zeilen -> versuche neuen Chat über das Adressbuch
-      const newChatResult = await this.startNewChat(page, chatName);
-      if (!newChatResult) {
-        throw new Error(`Chat oder Kollege '${chatName}' wurde in Teams (${t}) weder in bestehenden Chats noch im Adressbuch gefunden.`);
+    // --- B1 (17.11.2026): STRICT-Chat-Auflösung — KEIN Fuzzy-Fallback mehr ------
+    // Root Cause des Incidents: sendMessage nutzte die tolerante pickChatRow
+    // (Token-ALL-Substring) und im Nicht-Treffer-Fall startNewChat mit Blind-First.
+    // Ziel "Lena and Niklas" konnte so im Gruppen-Chat "adessi @ d.velop" landen.
+    // Jetzt: exakte Auflösung (resolveChatRowStrict) oder KLARER FEHLER mit
+    // Kandidatenliste; Adressbuch-Pfad nur noch ohne Blind-First (B2).
+    let picked = null;
+    let resolvedVia = null;
+    if (typeof chatIndex === 'number') {
+      // --- B4 (17.11.2026): chat_index fürs Senden DEPRECATED --------------------
+      // Weiterhin nutzbar, aber: (1) OUT-OF-RANGE ist KEIN stiller Fallback auf den
+      // aktuell geöffneten Chat mehr, (2) das Tool-Schema/README markieren den
+      // Parameter als deprecated, (3) das Ergebnis liefert ein warning-Feld.
+      if (chatIndex < 0 || chatIndex >= filtered.length) {
+        throw new Error(
+          `chat_index ${chatIndex} ist außerhalb der Chatliste (${filtered.length} Einträge). ` +
+          `Gültige Indizes: 0..${Math.max(0, filtered.length - 1)}. chat_index ist fürs Senden DEPRECATED — bitte chat_name exakt wie in teams_list_chats angeben. Es wurde NICHTS gesendet.`
+        );
       }
-      picked = newChatResult;
+      picked = { row: filtered[chatIndex].row, title: filtered[chatIndex].title, isNewChat: false };
+      resolvedVia = 'chat_index (DEPRECATED fürs Senden)';
     } else {
-      await this.dismissOverlays(page);
-      await picked.row.click().catch(async () => {
+      picked = TeamsClient.resolveChatRowStrict(filtered, chatName);
+      resolvedVia = 'chat_name (STRICT)';
+      if (!picked) {
+        // Chat nicht (exakt) in der Liste -> NEUER Chat über das Adressbuch —
+        // aber ohne Blind-First und mit To-Well-Verifikation (B2).
+        const newChatResult = await this.startNewChat(page, chatName);
+        if (!newChatResult) {
+          throw new Error(
+            `Chat oder Kollege '${chatName}' wurde weder EINDEUTIG in bestehenden Chats ` +
+            `(exakter Match, case-insensitive, inkl. "Nachname, Vorname"-Variante) noch eindeutig im Adressbuch gefunden. ` +
+            `Keine Nachricht gesendet. Passende Kandidaten aus der aktuellen Chatliste: ` +
+            `${TeamsClient.fuzzyChatCandidates(filtered, chatName).map((x) => `'${x}'`).join(', ') || '(keine)'}.`
+          );
+        }
+        if (newChatResult.toWellVerified === false) {
+          throw new Error(
+            `Adressbuch-Treffer '${newChatResult.title}' für '${chatName}' bestand die To-Feld-Verifikation NICHT ` +
+            `(${newChatResult.toWellReason} To-Feld-Chips: ${newChatResult.toWellTexts.join(', ') || '(keine)'}). ` +
+            `Compose wurde abgebrochen, KEINE Nachricht gesendet. Vorschläge waren: ${(newChatResult.suggestions || []).join(', ') || '(keine)'}.`
+          );
+        }
+        picked = { title: newChatResult.title, isNewChat: true, toWellTexts: newChatResult.toWellTexts };
+        resolvedVia = 'Adressbuch (neuer Chat, To-Well verifiziert)';
+      } else {
         await this.dismissOverlays(page);
-        await picked.row.click({ force: true });
-      });
-      await page.waitForTimeout(2500);
+        await picked.row.click().catch(async () => {
+          await this.dismissOverlays(page);
+          await picked.row.click({ force: true });
+        });
+        await page.waitForTimeout(2500);
+      }
+    }
+
+    // --- B3 (17.11.2026): PRE-SEND-GATE — verifizieren VOR dem Tippen -----------
+    // Früher wurde der Sicherheitsnetz-Check erst NACH dem Senden ausgeführt.
+    // Jetzt: Der geöffnete Chat muss dem Ziel EXAKT entsprechen (Strict-Equality
+    // statt Token-ALL), BEVOR auch nur ein Zeichen in das Compose-Feld geschrieben
+    // wird. Bei neuen Adressbuch-Chats ist die To-Well-Verifikation aus startNewChat
+    // der Gate (es gibt noch keinen Chat-Pane-Header).
+    let activeChat = null;
+    if (!picked.isNewChat) {
+      activeChat = await this.getActiveChatTitle(page);
+      if (!TeamsClient.chatTitleExactMatch(picked.title, activeChat)) {
+        throw new Error(
+          `Pre-Send-Gate: Der geöffnete Chat '${activeChat}' entspricht NICHT exakt dem Ziel '${picked.title}' ` +
+          `(Strict-Equality, keine Fuzzy-Toleranz). Es wurde NICHTS getippt und NICHTS gesendet. ` +
+          `Bitte chat_name exakt wie in teams_list_chats angeben.`
+        );
+      }
     }
 
     // Compose-Feld GEZIELT im geöffneten Chat-Pane finden. WICHTIG: Darf NICHT das
@@ -1944,8 +2092,34 @@ export class TeamsClient {
     } catch (e) {
       throw new Error("Chat-Komposefeld im geöffneten Chat nicht gefunden. Keine Nachricht gesendet.");
     }
-    // ElementHandle holen ist optional (Locator.click funktioniert direkt)
     await this.dismissOverlays(page);
+
+    // Send-Button-Präsenz VOR dem Dry-Run-Return prüfen (echter Teil der Verifikation)
+    const sendButton = await page.$('button[data-tid="newMessageCommands-send"], button[data-tid="send-message-button"], button[aria-label*="Send"], button[aria-label*="Senden"]');
+
+    // --- B5 (17.11.2026): dry_run / Preview --------------------------------------
+    // Führt ALLES bis auf den eigentlichen Versand aus: STRICT-Chat-Auflösung,
+    // Pre-Send-Gate bzw. To-Well-Verifikation, Compose- und Send-Button-Prüfung.
+    // Es wird NICHTS getippt und NICHTS gesendet — Zustand des Chats bleibt unberührt.
+    if (dryRun) {
+      return {
+        success: true,
+        dryRun: true,
+        tenant: t,
+        wouldSendTo: picked.title,
+        resolvedVia,
+        confirmedActiveChat: picked.isNewChat ? picked.title : activeChat,
+        recipientVerified: picked.isNewChat ? true : TeamsClient.chatTitleExactMatch(picked.title, activeChat),
+        toWellVerified: picked.isNewChat ? true : undefined,
+        toWellTexts: picked.toWellTexts,
+        composeFound: true,
+        sendButtonFound: Boolean(sendButton),
+        message,
+        attachments: validAttachments.map(p => path.basename(p)),
+        note: 'dry_run — nichts getippt, nichts gesendet. Ohne dry_run würde diese Nachricht exakt so an wouldSendTo gehen.'
+      };
+    }
+
     await composeCtl.click().catch(async () => {
       await this.dismissOverlays(page);
       await composeCtl.click({ force: true });
@@ -1960,30 +2134,32 @@ export class TeamsClient {
     }
 
     await this.dismissOverlays(page);
-    const sendButton = await page.$('button[data-tid="newMessageCommands-send"], button[data-tid="send-message-button"], button[aria-label*="Send"], button[aria-label*="Senden"]');
-    if (sendButton) {
-      await sendButton.click().catch(async () => {
+    const liveSendButton = sendButton || await page.$('button[data-tid="newMessageCommands-send"], button[data-tid="send-message-button"], button[aria-label*="Send"], button[aria-label*="Senden"]');
+    if (liveSendButton) {
+      await liveSendButton.click().catch(async () => {
         await this.dismissOverlays(page);
-        await sendButton.click({ force: true });
+        await liveSendButton.click({ force: true });
       });
     } else {
       await page.keyboard.press('Enter');
     }
     await page.waitForTimeout(2000);
 
-    const activeChat = await this.getActiveChatTitle(page);
+    const activeAfterSend = await this.getActiveChatTitle(page);
 
-    // Verifizieren, dass der aktive Chat dem Ziel entspricht (Sicherheitsnetz,
-    // vereinheitlicht via chatTitlesConsistent — Fix T1 15.10.2026)
-    if (!TeamsClient.chatTitlesConsistent(picked.title, activeChat)) {
-      throw new Error(`Sicherheitsnetz: Der geöffnete Chat-Titel '${activeChat}' stimmt nicht mit Ziel '${picked.title}' überein. Nachricht wurde NICHT gesendet.`);
+    // Sicherheitsnetz NACH dem Senden (weicher chatTitlesConsistent — die Nachricht
+    // ist jetzt draußen; der Fehler muss das ehrlich sagen).
+    if (!TeamsClient.chatTitlesConsistent(picked.title, activeAfterSend)) {
+      throw new Error(`Sicherheitsnetz (nach dem Senden): Der aktive Chat '${activeAfterSend}' stimmt nicht mit dem Ziel '${picked.title}' überein. Die Nachricht wurde VERSCHICKT — bitte sofort prüfen, in welchem Chat sie gelandet ist.`);
     }
 
     return {
       success: true,
       tenant: t,
       recipient: picked.title,
-      confirmedActiveChat: activeChat,
+      resolvedVia,
+      ...(typeof chatIndex === 'number' ? { warning: 'chat_index ist fürs Senden DEPRECATED — bitte künftig chat_name exakt angeben.' } : {}),
+      confirmedActiveChat: activeAfterSend,
       messageSent: message,
       attachments: validAttachments.map(p => path.basename(p)),
       status: validAttachments.length > 0

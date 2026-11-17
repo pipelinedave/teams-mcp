@@ -87,10 +87,19 @@ und Nachrichten senden – jeweils in einem isolierten Browser-Profil pro Konto/
   Ziel entspricht — bei Nicht-Chat-Einträgen gibt es einen klaren Fehler statt stiller
   Fehlresolvenz. Ist ein Kollege noch nicht in der Chat-Liste, startet `teams_send_message`
   vollautomatisch einen neuen Chat über das globale Unternehmensadressbuch (GAL / People-Picker).
-- **Sichere Sendesemantik**: `teams_send_message` sendet nicht blind in den aktiven
+- **Sichere Sendesemantik (B1–B5, 17.11.2026)**: `teams_send_message` sendet nicht blind in den aktiven
   Chat, wenn der Ziel-Chat nicht eindeutig gefunden wird – es wirft stattdessen einen Fehler.
-  Vor dem Versand verifiziert ein **Sicherheitsnetz**, dass der tatsächlich geöffnete Chat dem
-  Ziel entspricht, sonst wird abgebrochen (kein Fehlversand).
+  **STRICT-Chat-Auflösung (B1)**: kein Fuzzy-/Token-Fallback mehr — `chat_name` muss exakt wie in
+  `teams_list_chats` lauten, sonst klarer Fehler mit Kandidatenliste (Incident-Root-Cause: Fuzzy-Resolvenz
+  + Blind-First-Adressbuch hatte "Lena and Niklas" im Gruppen-Chat "adessi @ d.velop" landen lassen).
+  **Kein Blind-First (B2)**: im Adressbuch-Pfad wird nur eine Suggestion geklickt, die zum Ziel passt,
+  und anschließend das To-Feld verifiziert (Empfänger-Chip gegen den Namen geprüft); bei Mismatch wird
+  das Compose abgebrochen und nichts gesendet. **Pre-Send-Gate (B3)**: der geöffnete Chat wird VOR dem
+  Tippen per Strict-Equality gegen das Ziel verifiziert — erst danach wird geschrieben/gesendet.
+  **`chat_index` ist fürs Senden DEPRECATED (B4)**: weiterhin nutzbar, aber range-validiert und mit
+  `warning`-Feld im Ergebnis; bitte `chat_name` verwenden. **`dry_run: true` (B5)**: verifiziert
+  STRICT-Auflösung, Gate/To-Feld, Compose- und Send-Button und gibt eine Preview zurück — ohne zu
+  tippen und ohne zu senden (ideal für Agenten: erst prüfen, dann echt senden).
 - **Mehrzeilige Nachrichten**: Nachrichten werden per **Clipboard-Paste** eingefügt statt per
   Tastatureingabe – dadurch bleiben Umlaute/Sonderzeichen intakt und Zeilenumbrüche werden
   nicht fälschlich als „Absenden“ interpretiert (kein Zersplittern in mehrere Fragmente).
