@@ -39,7 +39,25 @@ export class TeamsClient {
     if (currentUrl.includes('login.microsoftonline.com')) {
       throw new Error(`Nicht in Teams (${t}) angemeldet. Bitte führe teams_login({ tenant: "${t}" }) in einem sichtbaren Fenster aus.`);
     }
+    await this.dismissOverlays(page);
     return page;
+  }
+
+  async dismissOverlays(page) {
+    if (!page || page.isClosed()) return;
+    try {
+      await page.evaluate(() => {
+        // Microsoft Floodgate survey / NPS banner / feedback overlay
+        const survey = document.getElementById('floodgateSurveyContainer');
+        if (survey) {
+          const closeBtn = survey.querySelector('button[aria-label*="Close" i], button[aria-label*="Schließen" i], button[data-tid*="close" i], .ms-Dialog-button--close');
+          if (closeBtn) closeBtn.click();
+          else survey.remove();
+        }
+        const surveys = document.querySelectorAll('[id*="floodgate" i], [class*="floodgate" i]');
+        surveys.forEach((el) => el.remove());
+      });
+    } catch { /* non-fatal */ }
   }
 
   async checkStatus(tenant = '') {
@@ -316,10 +334,11 @@ export class TeamsClient {
     for (const v of TeamsClient.chatTitleVariants(targetTitle)) {
       if (a === v || a.includes(v) || v.includes(a)) return true;
     }
+    const STOPWORDS = new Set(['and', 'und', 'the', 'der', 'die', 'das', 'mit', 'for', 'fuer']);
     const tokens = TeamsClient.normalizeChatTitle(targetTitle)
       .replace(/,/g, ' ')
       .split(/\s+/)
-      .filter((t) => t.length >= 3);
+      .filter((t) => t.length >= 3 && !STOPWORDS.has(t));
     return tokens.length > 0 && tokens.every((tok) => a.includes(tok));
   }
 
@@ -707,17 +726,18 @@ export class TeamsClient {
       }
 
       // Nur Nachrichten-Bilder behandeln: Teams nutzt blob:-URLs auch für flüchtige UI-Icons
-      // (Buttons, Avatare, Reaktionen/Sticker). Diese dürfen NICHT als Nachrichten-Medien gelten.
+      // (Avatare, Reaktionen/Sticker). Diese dürfen NICHT als Nachrichten-Medien gelten.
+      // Wichtig: Nachrichten-Bilder sind in Teams oft in Buttons/Links (Lightbox-Klick) verpackt,
+      // daher dürfen Buttons/Links innerhalb des Nachrichtenbereichs NICHT pauschal blockiert werden.
       const isUiControl = (el) => {
         let cur = el.parentElement;
         while (cur && cur !== document.body) {
-          const tag = cur.tagName;
           const cls = typeof cur.className === 'string' ? cur.className : '';
-          if (tag === 'BUTTON' || tag === 'A' || cur.getAttribute('role') === 'button' ||
-              cls.includes('fui-Button') || cls.includes('fui-Avatar') || cls.includes('fui-CounterBadge')) {
+          const tid = typeof cur.getAttribute === 'function' ? (cur.getAttribute('data-tid') || '') : '';
+          if (cls.includes('fui-Avatar') || cls.includes('fui-CounterBadge') || (typeof isReactionArtifact === 'function' && isReactionArtifact({ className: cls, dataTid: tid }))) {
             return true;
           }
-          if (/react|Reaction|sticker|Picker/i.test(cls)) return true;
+          if (/react|Reaction|sticker|Picker/i.test(cls) || /diverse-reaction|add-reaction-picker|reaction-picker|reactions-summary/.test(tid)) return true;
           cur = cur.parentElement;
         }
         return false;
@@ -726,7 +746,8 @@ export class TeamsClient {
         let cur = el.parentElement;
         while (cur && cur !== document.body) {
           const cls = typeof cur.className === 'string' ? cur.className : '';
-          if (cls.includes('fui-ChatMessage') || cls.includes('fui-ChatMyMessage') || cur.getAttribute('role') === 'listitem') return true;
+          const tid = typeof cur.getAttribute === 'function' ? (cur.getAttribute('data-tid') || '') : '';
+          if (cls.includes('fui-ChatMessage') || cls.includes('fui-ChatMyMessage') || cur.getAttribute('role') === 'listitem' || tid === 'chat-pane-message' || tid === 'message-body' || tid === 'channel-pane-message') return true;
           cur = cur.parentElement;
         }
         return false;
@@ -757,7 +778,7 @@ export class TeamsClient {
             const ctrl = new AbortController();
             const timer = setTimeout(() => ctrl.abort(), blobTimeoutMs);
             try {
-              const res = await fetch(url, { signal: ctrl.signal, cache: 'no-store' });
+              const res = await fetch(url, { signal: ctrl.signal });
               if (res && res.ok) {
                 const blob = await res.blob();
                 dataUrl = await new Promise((resolve) => {
@@ -771,6 +792,22 @@ export class TeamsClient {
               clearTimeout(timer);
             }
           } catch { dataUrl = null; }
+
+          // Fallback via Canvas, falls fetch fehlschlägt
+          if (!dataUrl) {
+            try {
+              const matchingImg = blobImgs.find((img) => (img.getAttribute('src') || img.src) === url);
+              if (matchingImg && (matchingImg.naturalWidth > 0 || matchingImg.width > 0)) {
+                const cvs = document.createElement('canvas');
+                cvs.width = matchingImg.naturalWidth || matchingImg.width;
+                cvs.height = matchingImg.naturalHeight || matchingImg.height;
+                const ctx = cvs.getContext('2d');
+                ctx.drawImage(matchingImg, 0, 0);
+                dataUrl = cvs.toDataURL('image/png');
+              }
+            } catch { /* Canvas-Fallback ignoriert Fehler */ }
+          }
+
           blobData[url] = dataUrl;
         }));
       } catch { /* Blob-Extraktion scheitert nie fatal: Nachrichten bleiben erhalten */ }
@@ -1886,7 +1923,11 @@ export class TeamsClient {
       }
       picked = newChatResult;
     } else {
-      await picked.row.click();
+      await this.dismissOverlays(page);
+      await picked.row.click().catch(async () => {
+        await this.dismissOverlays(page);
+        await picked.row.click({ force: true });
+      });
       await page.waitForTimeout(2500);
     }
 
@@ -1904,7 +1945,11 @@ export class TeamsClient {
       throw new Error("Chat-Komposefeld im geöffneten Chat nicht gefunden. Keine Nachricht gesendet.");
     }
     // ElementHandle holen ist optional (Locator.click funktioniert direkt)
-    await composeCtl.click();
+    await this.dismissOverlays(page);
+    await composeCtl.click().catch(async () => {
+      await this.dismissOverlays(page);
+      await composeCtl.click({ force: true });
+    });
     await page.waitForTimeout(500);
     await this.insertTextViaPaste(page, message);
     await page.waitForTimeout(600);
@@ -1914,9 +1959,13 @@ export class TeamsClient {
       await this.attachFiles(page, validAttachments);
     }
 
+    await this.dismissOverlays(page);
     const sendButton = await page.$('button[data-tid="newMessageCommands-send"], button[data-tid="send-message-button"], button[aria-label*="Send"], button[aria-label*="Senden"]');
     if (sendButton) {
-      await sendButton.click();
+      await sendButton.click().catch(async () => {
+        await this.dismissOverlays(page);
+        await sendButton.click({ force: true });
+      });
     } else {
       await page.keyboard.press('Enter');
     }
@@ -1941,6 +1990,223 @@ export class TeamsClient {
         ? `Nachricht mit ${validAttachments.length} Anhang/Anhängen erfolgreich gesendet.`
         : "Nachricht erfolgreich gesendet."
     };
+  }
+
+  // Setzt eine Emoji-Reaktion (z.B. 👍) an einer identifizierten Nachricht.
+  // Konsistent zum getMessages-Send-Flow: STRICT-Chat-Aufloesung + Sicherheitsnetz
+  // (chatTitlesConsistent), damit NIE in einem still verwechselten Chat reagiert wird.
+  // Nach dem Klick wird die Reaktion per collectReactionsFromRow zurueckgelesen und
+  // verifiziert, dass sie (a) an der richtigen mid und (b) als eigene (byMe) haengt —
+  // sonst klarer Fehler statt falschem "erledigt".
+  async reactToMessage(tenant = '', { messageId, emoji, chatIndex, chatName, reaction } = {}) {
+    if (!messageId) throw new Error("message_id ist erforderlich (Mid der Nachricht aus teams_get_messages, Feld 'mid').");
+    const rawReaction = emoji || reaction;
+    const target = resolveReactionTarget(rawReaction);
+    if (!target) throw new Error("Reaktion (emoji) ist erforderlich. Nutze einen Slug (z.B. 'like', 'heart', 'checkmark') oder ein Emoji-Glyph (z.B. '👍').");
+
+    const t = browserManager.normalizeTenant(tenant);
+    const page = await this.getPage(t, true);
+
+    const filtered = await this.getFilteredChatRows(page);
+    if (filtered.length === 0) throw new Error("Keine Chats in Teams gefunden.");
+
+    // --- Ziel-Chat deterministisch aufloesen (wie getMessages, Fix T1) ---
+    let picked = null;
+    if (typeof chatIndex === 'number') {
+      if (chatIndex < 0 || chatIndex >= filtered.length) {
+        throw new Error(
+          `chat_index ${chatIndex} ist außerhalb der Chatliste (${filtered.length} Einträge). ` +
+          `Gültige Indizes: 0..${Math.max(0, filtered.length - 1)}. Liste via teams_list_chats abrufen.`
+        );
+      }
+      picked = { row: filtered[chatIndex].row, title: filtered[chatIndex].title };
+      await picked.row.click();
+      await page.waitForTimeout(2500);
+    } else if (chatName) {
+      picked = TeamsClient.resolveChatRowStrict(filtered, chatName);
+      if (!picked) {
+        const candidates = TeamsClient.fuzzyChatCandidates(filtered, chatName);
+        throw new Error(
+          `Chat '${chatName}' wurde in der Chatliste nicht EINDEUTIG gefunden (exakter Match, case-insensitive, inkl. "Nachname, Vorname"-Variante). ` +
+          `Es wurde KEINE Reaktion gesetzt. Passende Kandidaten: ` +
+          `${candidates.length ? candidates.map((x) => `'${x}'`).join(', ') : '(keine — Chatliste evtl. zu kurz geladen)'}. ` +
+          `Bitte chat_name exakt angeben oder chat_index verwenden.`
+        );
+      }
+      await picked.row.click();
+      await page.waitForTimeout(2500);
+    } else {
+      throw new Error("chat_name oder chat_index ist erforderlich — es wird bewusst nicht im unbestimmten 'aktiven' Chat reagiert (Mismatch-Schutz).");
+    }
+
+    // --- Sicherheitsnetz: geoeffneter Chat muss dem Ziel entsprechen ---
+    const activeChat = await this.getActiveChatTitle(page);
+    await page.waitForSelector('[data-tid="chat-pane-message"], [data-tid="message-body"], .fui-ChatMessage__body, .fui-ChatMyMessage__body', { timeout: 15000 }).catch(() => null);
+    if (!TeamsClient.chatTitlesConsistent(picked.title, activeChat)) {
+      throw new Error(`Sicherheitsnetz: Der geöffnete Chat '${activeChat}' stimmt nicht mit dem Ziel '${picked.title}' überein. Es wurde KEINE Reaktion gesetzt.`);
+    }
+
+    // --- Ziel-Nachricht per data-mid im geladenen Pane finden ---
+    await this._scrollChatToLatest(page);
+    const msgSelectors = '[data-tid="chat-pane-message"], [data-tid="message-body"], .fui-ChatMessage__body, .fui-ChatMyMessage__body';
+    const found = await page.evaluate(({ mid, sel }) => {
+      const bodies = Array.from(document.querySelectorAll(sel));
+      const target = bodies.find((b) => b.getAttribute && b.getAttribute('data-mid') === mid);
+      if (!target) return { found: false };
+      const row = target.closest('[data-tid="channel-pane-message"], .fui-ChatMessage, .fui-ChatMyMessage, [role="listitem"], [role="group"]') || target;
+      row.scrollIntoView({ block: 'center' });
+      return { found: true, mid: target.getAttribute('data-mid') };
+    }, { mid: String(messageId), sel: msgSelectors });
+    if (!found || !found.found) {
+      throw new Error(
+        `Nachricht mit mid '${messageId}' wurde im geladenen Verlauf von '${activeChat}' nicht gefunden. ` +
+        `Bitte zuerst teams_get_messages auf diesen Chat (chat_name/chat_index) laufen lassen und die exakte 'mid' dieser Nachricht uebergeben — die Nachricht muss im aktuell geladenen Fenster liegen.`
+      );
+    }
+    await page.waitForTimeout(800);
+
+    // --- Reaktions-Picker oeffnen (defensive Mehrfach-Strategie) ---
+    const opened = await this._openReactionPickerForMessage(page, String(messageId));
+    if (!opened || !opened.clicked) {
+      throw new Error(
+        `Reaktions-Picker an Nachricht '${messageId}' konnte nicht geoeffnet werden (kein Add-Reaction-/React-Button gefunden). ` +
+        `Pruefe, ob die Nachricht im geladenen Fenster liegt (teams_get_messages) und ob sie fuer Reaktionen freigegeben ist. Keine Reaktion gesetzt.`
+      );
+    }
+
+    // --- Emoji im Picker auswaehlen ---
+    await page.waitForTimeout(600);
+    const pickerRes = await this._pickEmojiInPicker(page, target);
+    if (!pickerRes || !pickerRes.clicked) {
+      await page.keyboard.press('Escape').catch(() => {});
+      throw new Error(
+        `Reaktion '${rawReaction}' (slug=${target.slug || '-'}) wurde im geoeffneten Reaktions-Picker nicht gefunden. ` +
+        `Verfuegbare Picker-Eintraege: ${pickerRes && pickerRes.labels ? pickerRes.labels.slice(0, 20).join(', ') : '(unbekannt)'}. Keine Reaktion gesetzt.`
+      );
+    }
+    await page.waitForTimeout(1200);
+
+    // --- Verifikation: Reaktion zuruecklesen und Auswahl an der richtigen mid bestaetigen ---
+    const verify = await page.evaluate(({ mid, helpers }) => {
+      const collect = new Function('return (' + helpers.collect + ')')();
+      const bodies = Array.from(document.querySelectorAll('[data-tid="chat-pane-message"], [data-tid="message-body"], .fui-ChatMessage__body, .fui-ChatMyMessage__body'));
+      const target = bodies.find((b) => b.getAttribute && b.getAttribute('data-mid') === mid);
+      if (!target) return { ok: false, reason: 'message-missing' };
+      const row = target.closest('[data-tid="channel-pane-message"], .fui-ChatMessage, .fui-ChatMyMessage, [role="listitem"], [role="group"]') || target;
+      return { ok: true, reactions: collect(row) || [] };
+    }, { mid: String(messageId), helpers: { collect: collectReactionsFromRow.toString() } });
+
+    const reactions = (verify && verify.reactions) || [];
+    const byMe = reactions.find((r) => r.byMe && (target.slug ? (r.type === target.slug) : true));
+    const glyphMatch = target.glyph && reactions.find((r) => r.byMe && r.emoji && (r.emoji === target.glyph || r.emoji.includes(target.glyph)));
+    const matched = !!byMe || !!glyphMatch;
+
+    if (!matched) {
+      throw new Error(
+        `Reaktion konnte an Nachricht '${messageId}' nach dem Klick nicht als eigene bestaetigt werden. ` +
+        `Vorhandene Reaktionen an der mid: ${JSON.stringify(reactions)}. Kein falsches 'erledigt' — bitte manuell pruefen.`
+      );
+    }
+
+    return {
+      success: true,
+      tenant: t,
+      recipient: activeChat,
+      messageId: String(messageId),
+      emojiRequested: rawReaction,
+      emojiResolved: target.glyph || target.slug,
+      verified: true,
+      reactionsOnMessage: reactions,
+      status: `Reaktion (${target.glyph || target.slug}) an Nachricht '${messageId}' in Chat '${activeChat}' gesetzt und verifiziert.`
+    };
+  }
+
+  // Oeffnet den Reaktions-Picker fuer die Nachricht mit der angegebenen mid.
+  // Defensive Mehrfach-Strategie: (1) vorhandener Add-Reaction-Plus-Button in den
+  // bestehenden Reaktions-Pills der Nachricht, sonst (2) Hover-Actions-React-Button
+  // im Message-Container. Liefert { clicked, via } oder { clicked:false, reason }.
+  async _openReactionPickerForMessage(page, mid) {
+    const msgSelectors = '[data-tid="chat-pane-message"], [data-tid="message-body"], .fui-ChatMessage__body, .fui-ChatMyMessage__body';
+    await page.waitForTimeout(400);
+
+    // Playwright-Hover auf der Ziel-Row, damit das Hover-Actions-Toolbar/Reaktions-Pills rendern
+    const rowHandle = await page.evaluateHandle(({ mid, sel }) => {
+      const target = Array.from(document.querySelectorAll(sel))
+        .find((b) => b.getAttribute && b.getAttribute('data-mid') === mid);
+      if (!target) return null;
+      return target.closest('[data-tid="channel-pane-message"], .fui-ChatMessage, .fui-ChatMyMessage, [role="listitem"], [role="group"]') || target;
+    }, { mid, sel: msgSelectors });
+    const rowEl = rowHandle.asElement();
+    let hasRow = !!rowEl;
+    if (rowEl) {
+      try { await rowEl.scrollIntoViewIfNeeded(); } catch (e) {}
+      try { await rowEl.hover(); } catch (e) {}
+      await page.waitForTimeout(450);
+    } else {
+      return { clicked: false, reason: 'no-target-row' };
+    }
+
+    // Picker-Oeffner im Message-Container suchen und klicken
+    const clickRes = await page.evaluate(({ mid, sel }) => {
+      const target = Array.from(document.querySelectorAll(sel))
+        .find((b) => b.getAttribute && b.getAttribute('data-mid') === mid);
+      if (!target) return { clicked: false, reason: 'no-target' };
+      const row = target.closest('[data-tid="channel-pane-message"], .fui-ChatMessage, .fui-ChatMyMessage, [role="listitem"], [role="group"]') || target;
+      const click = (el) => { if (el) { try { el.click(); } catch (e) {} } };
+      // (a) Add-Reaction-Plus-Button innerhalb der bestehenden Reaktionen der Nachricht
+      const addBtn = row.querySelector('[data-tid="add-reaction-picker-entry-point-button"], [data-tid*="add-reaction-picker" i]');
+      if (addBtn) { click(addBtn); return { clicked: true, via: 'add-reaction-pill' }; }
+      // (b) Hover-Actions-React-Button im Message-Container (neueres Teams rendert ihn beim Hover)
+      const reactBtns = row.querySelectorAll(
+        '[data-tid="react-button"], [data-tid*="react" i][role="button"], [data-tid*="react" i] button, [role="button"][aria-label*="react" i], [role="button"][aria-label*="reaktion" i]'
+      ) || [];
+      for (const rb of reactBtns) {
+        const key = (rb.getAttribute && ((rb.getAttribute('data-tid') || '') + '|' + (rb.getAttribute('aria-label') || ''))) || '';
+        if (/react|reaktion|smiley|emoji/i.test(key)) { click(rb); return { clicked: true, via: 'hover-react-button' }; }
+      }
+      return { clicked: false, reason: 'no-picker-opener' };
+    }, { mid, sel: msgSelectors });
+
+    return clickRes && clickRes.clicked ? clickRes : { clicked: false, reason: (clickRes && clickRes.reason) || 'no-picker-opener' };
+  }
+
+  // Sucht im geoeffneten Reaktions-Picker das gewuenschte Emoji und klickt es.
+  // Liefert { clicked, labels } — labels = abgeglichene Picker-Eintraege fuer Fehlermeldung.
+  // pickerElementMatches wird als reine Funktion in den Browser-Kontext serialisiert.
+  async _pickEmojiInPicker(page, target) {
+    const res = await page.evaluate(({ tgt, matchFn }) => {
+      const match = new Function('return (' + matchFn + ')')();
+      const click = (el) => { if (el) { try { el.click(); } catch (e) {} } };
+      const visible = (el) => (el.offsetParent !== null || el.getClientRects().length > 0);
+      const labels = [];
+      // Picker-Popover/Emoji-Roots (sichtbare) sammeln
+      const pickerRoots = Array.from(document.querySelectorAll(
+        '[data-tid="reaction-picker"], [data-tid*="reaction-picker" i], [data-tid*="emoticon-picker" i], [data-tid*="emoji-picker" i], [role="menu"], .fui-PopoverSurface'
+      )).filter(visible);
+      const tryMatch = (list) => {
+        for (const c of list) {
+          labels.push((c.getAttribute && (c.getAttribute('aria-label') || c.getAttribute('title'))) || (c.innerText || '').trim().slice(0, 12));
+          if (match(c, tgt)) { click(c); return true; }
+        }
+        return false;
+      };
+      if (pickerRoots.length) {
+        const candidates = (() => {
+          const set = [];
+          for (const root of pickerRoots) {
+            set.push(...Array.from(root.querySelectorAll('button[role="menuitem"], button, [role="button"], [role="option"], [data-tid*="picker-item" i], [data-tid*="emoji" i], span[data-tid*="emoji" i]')));
+          }
+          return Array.from(new Set(set));
+        })();
+        if (tryMatch(candidates)) return { clicked: true, labels };
+        return { clicked: false, labels };
+      }
+      // Fallback: global nach sichtbaren Emoji-Buttons mit passendem Glyph suchen
+      const allBtns = Array.from(document.querySelectorAll('button[data-tid], [role="button"][aria-label], button[role="menuitem"]')).filter(visible);
+      if (tryMatch(allBtns)) return { clicked: true, labels };
+      return { clicked: false, labels };
+    }, { tgt: target, matchFn: pickerElementMatches.toString() });
+    return res;
   }
   async getMeetingStatus(tenant = '') {
     const t = browserManager.normalizeTenant(tenant);
@@ -2672,6 +2938,81 @@ export function collectReactionsFromRow(row) {
   }
 
   return out;
+}
+
+// --- Emoji/Reaktions-Aufloesung fuer teammates_react (teams_react) -------------------
+// Mapping gebraeuchlicher Teams-Reaktions-Slugs (die sprachunabhaengigen Slug aus
+// collectReactionsFromRow, z.B. "like"/"heart"/"laugh") auf das zugehoerige Emoji-Glyph.
+// Ueberdeckt die im Teams-Picker typischerweise angebotenen Schnell-Reaktionen (Befund
+// aus dem Teams-Web-DOM: like, love/laugh, sad, angry + Parse-Emoji). Der "checkmark"
+// erfasst das freigaberelevante ✅ (Teams rendert es je nach Version unter verschiedenen
+// Slugs wie "2705_whiteheavycheckmark"). Einem Slug kann ein explizites Glyph zugeordnet
+// sein; fuer nicht gelistete Slugs/Glyphen faehrt die Picker-Aufloesung ueber den
+// freien Text-/Glyph-Abgleich.
+export const EMOJI_SLUG_MAP = {
+  like: '👍',
+  thumbsup: '👍',
+  yes: '👍',
+  heart: '❤️',
+  love: '❤️',
+  laugh: '😄',
+  haha: '😄',
+  cry: '😢',
+  sad: '😢',
+  surprised: '😮',
+  wow: '😮',
+  rofl: '😂',
+  angry: '😠',
+  checkmark: '✅',
+  check: '✅',
+  '2705_whiteheavycheckmark': '✅',
+  celebrate: '🎉',
+  '80a82b02055d463a8e6bd1b7f3d8b7e5': '🎉',
+  eyes: '👀',
+  lightbulb: '💡'
+};
+
+// Normalisiert das Benutzer-Eingabefeld einer Reaktion ({ emoji | slug | reaction }) in
+// { slug, glyph }. Akzeptiert sowohl ein Emoji-Glyph ("👍", "❤️") als auch einen
+// Slug/Kurznamen ("like", "checkmark", "2705_whiteheavycheckmark"). Leere/unbekannte
+// Eingaben liefern null (Fehlerpfad).
+export function resolveReactionTarget(input) {
+  const raw = String(input == null ? '' : input).trim();
+  if (!raw) return null;
+  const hasNonAscii = /[^\x20-\x7E]/.test(raw); // echtes Emoji-Glyph?
+  if (hasNonAscii) {
+    return { slug: null, glyph: raw };
+  }
+  const slug = raw.toLowerCase();
+  const glyph = EMOJI_SLUG_MAP[slug];
+  return { slug, glyph: glyph || null };
+}
+
+// Pure (per .toString() in page.evaluate serialisierbare) Picker-Match-Logik: Prueft, ob
+// ein Picker-Element die gewuenschte Reaktion repraesentiert. Nimmt { slug, glyph } und
+// gleicht gegen aria-label / title / innerText / alt-Text enthaltenen Bilder / data-tid /
+// itemtype ab. Glyph-Vergleich gewinnt, sonst Slug-/Wortabgleich (case-insensitive, akzentfrei).
+export function pickerElementMatches(el, target) {
+  const clean = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase();
+  const text = clean((el.innerText || '') + ' ' + (el.getAttribute && (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '') + ' ' + (el.getAttribute('data-content-emoji') || '') + ' ' + (el.getAttribute('aria-valuetext') || '') + ' ' + (el.getAttribute('class') || '') + ' ' + (el.getAttribute('data-tid') || '') + ' ' + (el.getAttribute('itemtype') || '') + ' ' + (el.getAttribute('itemid') || '') + ' ' + (el.getAttribute('data-emoji') || '')));
+  if (target.glyph && text.includes(target.glyph)) return true;
+  // enthaltenes <img alt=...> eines Emojis beruecksichtigen
+  if (target.glyph && el.querySelector) {
+    const imgAlt = el.querySelector('img[alt]');
+    if (imgAlt) {
+      const a = clean(imgAlt.getAttribute('alt'));
+      if (a && a.includes(target.glyph)) return true;
+    }
+  }
+  if (target.slug) {
+    const slug = target.slug.toLowerCase();
+    // exakte Slug-Zeile (z.B. "like" / "2705_whiteheavycheckmark") im Attribut-Text
+    const attrText = clean((el.getAttribute && (el.getAttribute('data-tid') + '|' + el.getAttribute('itemtype') + '|' + el.getAttribute('itemid') + '|' + el.getAttribute('data-emoji') + '|' + el.getAttribute('aria-label'))) || '');
+    if (attrText && (attrText.includes(slug) || attrText.includes(slug.replace(/_/g, '')))) return true;
+    // Wortabgleich im sichtbaren Text / accessible name (z.B. "Like", "Heart", "Thumbs up")
+    if (text.split(/[^a-z0-9]+/i).some((tok) => tok && tok.toLowerCase() === slug)) return true;
+  }
+  return false;
 }
 
 // Extrahiert einen "name.ext"-Dateinamen aus beliebigem Text (Karten-Label, Button-Kontext).

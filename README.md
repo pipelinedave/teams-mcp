@@ -18,7 +18,7 @@ und Nachrichten senden – jeweils in einem isolierten Browser-Profil pro Konto/
   (`.teams-browser-profile-<tenant>`) – keine Session-Kollisionen.
 - **Tools**: `teams_status`, `teams_login`, `teams_list_chats`, `teams_get_messages`,
   `teams_get_channel_messages`, `teams_search`, `teams_list_teams`, `teams_send_message`,
-  `teams_inspect`, `teams_meeting_status`,
+  `teams_react`, `teams_inspect`, `teams_meeting_status`,
   `teams_start_tracking`, `teams_stop_tracking`, `teams_close`.
 - **Kanal-Nachrichten lesen**: `teams_get_channel_messages` navigiert über den Team-/Kanal-Baum
   (Sektion „Teams and channels“ der linken Rail) und liest Nachrichten aus Team-Kanälen —
@@ -39,6 +39,14 @@ und Nachrichten senden – jeweils in einem isolierten Browser-Profil pro Konto/
   Teams häufig ausschließlich per ✅-Reaktion erteilt — eine solche Reaktion ist in `reactions`
   sichtbar und darf nicht als „keine Rückmeldung“ gewertet werden. Reaktions-Chrome wird aus dem
   Markdown-Text entfernt, damit das Emoji den Nachrichtentext nicht verfälscht.
+- **Reaktionen setzen (Emojis)**: `teams_react` setzt eine Emoji-Reaktion (z.B. 👍) an einer
+  **identifizierten Nachricht** (`message_id` = Feld `mid` aus `teams_get_messages`) im Ziel-Chat
+  (`chat_name` oder `chat_index`). `emoji` akzeptiert Kurz-Slugs (`like`, `heart`, `laugh`, `cry`,
+  `surprised`, `rofl`, `checkmark`/✅, …) oder ein direktes Emoji-Glyph. **Mismatch-Schutz wie bei
+  `teams_get_messages`**: Der geöffnete Chat wird gegen das Ziel verifiziert — es wird nie im
+  unbestimmten „aktiven“ Chat reagiert. Nach dem Klick wird die Reaktion zurückgelesen und
+  verifiziert, dass sie als eigene (`byMe`) an genau dieser `mid` hängt; andernfalls meldet das Tool
+  einen klaren Fehler statt eines falschen Erfolgs.
 - **Autoren & Zeitstempel**: `author` liefert den echten Anzeigenamen (nicht mehr „Unbekannt“),
   `isOwn` kennzeichnet eigene Nachrichten. Für Kanal-Nachrichten wird der Subheader-Zeitstempel
   („6/23 4:44 PM“, „23.06. 16:44“) inkl. **abgeleitetem Jahr** zu ISO-8601 normalisiert

@@ -275,6 +275,33 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         }
       },
       {
+        name: 'teams_react',
+        description: 'Setzt eine Emoji-Reaktion (z.B. 👍) an einer identifizierten Nachricht in einem Microsoft Teams Chat. Benötigt die exakte message_id (Feld "mid" aus teams_get_messages) der Ziel-Nachricht sowie den Ziel-Chat (chat_name oder chat_index). Mismatch-Schutz wie bei teams_get_messages: der geöffnete Chat wird gegen das Ziel verifiziert, es wird nie im unbestimmten "aktiven" Chat reagiert. Nach dem Klick wird die Reaktion zurückgelesen und verifiziert, dass sie als eigene (byMe) an genau dieser Nachricht hängt — andernfalls klarer Fehler statt falschem Erfolg. emoji akzeptiert Slugs wie "like", "heart", "laugh", "cry", "surprised", "rofl", "checkmark" (✅) oder ein direktes Emoji-Glyph.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            message_id: {
+              type: 'string',
+              description: 'Exakte Mid der Ziel-Nachricht (Feld "mid" aus teams_get_messages), z.B. "1790155757631"'
+            },
+            emoji: {
+              type: 'string',
+              description: 'Reaktion als Slug (wie/like, heart, laugh, cry, surprised, rofl, checkmark/✅, celebrate) oder als Emoji-Glyph (z.B. "👍")'
+            },
+            chat_name: {
+              type: 'string',
+              description: 'Name des Ziel-Chats (exakt wie in teams_list_chats, inkl. "Nachname, Vorname"-Variante)'
+            },
+            chat_index: {
+              type: 'number',
+              description: 'Index des Ziel-Chats aus teams_list_chats (Alternative zu chat_name)'
+            },
+            tenant: tenantParam()
+          },
+          required: ['message_id', 'emoji']
+        }
+      },
+      {
         name: 'teams_inspect',
         description: 'Gibt technische Diagnose-Informationen über erkannte Teams-UI-Elemente, Chat-Pane, Compose-Footer, Buttons und Datei-Inputs zurück.',
         inputSchema: {
@@ -540,6 +567,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           message: args.message,
           chatName: args.chat_name,
           attachments: rawAttachments
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+        };
+      }
+
+      case 'teams_react': {
+        const tenant = resolveTenant(args?.tenant);
+        const result = await teamsClient.reactToMessage(tenant, {
+          messageId: args?.message_id,
+          emoji: args?.emoji,
+          chatName: args?.chat_name,
+          chatIndex: args?.chat_index
         });
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]

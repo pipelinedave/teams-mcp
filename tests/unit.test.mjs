@@ -17,6 +17,9 @@ import {
   collectAttachmentsFromRow,
   collectReactionsFromRow,
   isReactionArtifact,
+  resolveReactionTarget,
+  pickerElementMatches,
+  EMOJI_SLUG_MAP,
   extractFilenameFromText,
   normalizeExtensionWhitelist,
   extensionAllowed,
@@ -2223,5 +2226,96 @@ describe('IN_PAGE_HELPERS_SOURCE - Injektions-Factory (Fix 15.10.2026)', () => {
     assert.equal(helpers.isPlausibleSpeakerName('Anwesend'), false);
     assert.equal(helpers.speakerNameFromAriaLabel('Robert Lábas spricht'), 'Robert Lábas');
     assert.equal(helpers.isBotOrUiName('Copilot'), true);
+  });
+});
+
+// ============================================================================
+// teams_react - Emoji-/Reaktions-Aufloesung + Picker-Match (19.10.2026)
+// ============================================================================
+describe('resolveReactionTarget - Reaktions-Eingabe (Slug vs. Emoji-Glyph)', () => {
+  test('akzeptiert einen Emoji-Glyph direkt', () => {
+    const r = resolveReactionTarget('👍');
+    assert.equal(r.glyph, '👍');
+    assert.equal(r.slug, null);
+  });
+
+  test('akzeptiert einen Slug und mappt aufs Glyph', () => {
+    const r = resolveReactionTarget('like');
+    assert.equal(r.slug, 'like');
+    assert.equal(r.glyph, '👍');
+    assert.equal(resolveReactionTarget('heart').glyph, '❤️');
+    assert.equal(resolveReactionTarget('checkmark').glyph, '✅');
+  });
+
+  test('groß-/kleinschreibung und whitespace-tolerant', () => {
+    assert.deepEqual(resolveReactionTarget('  Like '), resolveReactionTarget('like'));
+  });
+
+  test('unbekannter reiner Slug bleibt Slug ohne Glyph (freier Picker-Abgleich)', () => {
+    const r = resolveReactionTarget('adesso-cody_hooray');
+    assert.equal(r.slug, 'adesso-cody_hooray');
+    assert.equal(r.glyph, null);
+  });
+
+  test('leere / ungültige Eingaben -> null', () => {
+    assert.equal(resolveReactionTarget(''), null);
+    assert.equal(resolveReactionTarget('   '), null);
+    assert.equal(resolveReactionTarget(null), null);
+    assert.equal(resolveReactionTarget(undefined), null);
+  });
+});
+
+describe('EMOJI_SLUG_MAP - gaengige Teams-Reaktions-Slugs', () => {
+  test('enthält die wichtigsten Slugs', () => {
+    assert.equal(EMOJI_SLUG_MAP.like, '👍');
+    assert.equal(EMOJI_SLUG_MAP.heart, '❤️');
+    assert.equal(EMOJI_SLUG_MAP.laugh, '😄');
+    assert.equal(EMOJI_SLUG_MAP.checkmark, '✅');
+    assert.equal(EMOJI_SLUG_MAP['2705_whiteheavycheckmark'], '✅');
+  });
+});
+
+describe('pickerElementMatches - Picker-Eintrag vs. Zielreaktion', () => {
+  function makePickerEl({ ariaLabel, title, tid, inner, imgAlt }) {
+    return {
+      innerText: inner || '',
+      getAttribute: (n) => {
+        if (n === 'aria-label') return ariaLabel ?? null;
+        if (n === 'title') return title ?? null;
+        if (n === 'data-tid') return tid ?? null;
+        return null;
+      },
+      querySelector: (sel) => (sel.includes('img') && imgAlt ? { getAttribute: (n) => (n === 'alt' ? imgAlt : null) } : null)
+    };
+  }
+
+  test('Glyph-Vergleich: Picker-Eintrag mit dem Emoji-Glyph matcht', () => {
+    const tgt = { slug: 'like', glyph: '👍' };
+    assert.equal(pickerElementMatches(makePickerEl({ inner: '👍' }), tgt), true);
+  });
+
+  test('Glyph im enthaltenen <img alt> matcht', () => {
+    const tgt = { slug: null, glyph: '❤️' };
+    assert.equal(pickerElementMatches(makePickerEl({ imgAlt: '❤️' }), tgt), true);
+  });
+
+  test('Slug-Wortabgleich in aria-label matcht ("Like" -> slug like)', () => {
+    const tgt = { slug: 'like', glyph: '👍' };
+    assert.equal(pickerElementMatches(makePickerEl({ ariaLabel: 'Like' }), tgt), true);
+  });
+
+  test('Slug-Attribut-Abgleich (data-tid) matcht', () => {
+    const tgt = { slug: 'heart', glyph: '❤️' };
+    assert.equal(pickerElementMatches(makePickerEl({ tid: 'picker-item-heart' }), tgt), true);
+  });
+
+  test('fremdes Emoji/Slug matcht NICHT', () => {
+    const tgt = { slug: 'like', glyph: '👍' };
+    assert.equal(pickerElementMatches(makePickerEl({ ariaLabel: 'Crying', inner: '😢' }), tgt), false);
+  });
+
+  test('leere Ziel-/Picker-Infos -> false (kein false-positive)', () => {
+    const tgt = { slug: null, glyph: null };
+    assert.equal(pickerElementMatches(makePickerEl({ ariaLabel: '' }), tgt), false);
   });
 });
